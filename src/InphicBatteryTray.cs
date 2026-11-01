@@ -143,6 +143,9 @@ namespace InphicBatteryTray
         public string Product;
         public string Transport;   // USB / 蓝牙
         public bool IsIn9;         // IN9 系列：需要主动查询
+        // [PATCH] 采集 Usage Page / Usage，仅用于日志观测，暂不参与筛选
+        public ushort UsagePage;
+        public ushort Usage;
         public int InLen;          // 输入报告长度
         public int OutLen;         // 输出报告长度
         public int FeatLen;        // Feature 报告长度
@@ -238,6 +241,9 @@ namespace InphicBatteryTray
                                     byte[] caps = new byte[256];
                                     if (Native.HidP_GetCaps(pp, caps) == 0x00110000)
                                     {
+                                        // [PATCH] HIDP_CAPS 布局：Usage 在偏移 0，UsagePage 在偏移 2
+                                        dev.Usage = BitConverter.ToUInt16(caps, 0);
+                                        dev.UsagePage = BitConverter.ToUInt16(caps, 2);
                                         dev.InLen = BitConverter.ToUInt16(caps, 4);
                                         dev.OutLen = BitConverter.ToUInt16(caps, 6);
                                         dev.FeatLen = BitConverter.ToUInt16(caps, 8);
@@ -418,7 +424,19 @@ namespace InphicBatteryTray
                 testTimer.Start();
             }
 
-            Application.Run();
+            // [PATCH] 退出时统一释放托盘图标、GDI 对象和定时器
+            try { Application.Run(); }
+            finally
+            {
+                running = false;
+                if (supervisor != null) { try { supervisor.Interrupt(); } catch { } }
+                if (statusTimer != null) statusTimer.Dispose();
+                if (popup != null) { try { popup.Dispose(); } catch { } }
+                if (tray != null) { try { tray.Visible = false; tray.Dispose(); } catch { } }
+                if (currentIcon != null) { try { currentIcon.Dispose(); } catch { } }
+                if (srcIcon != null) { try { srcIcon.Dispose(); } catch { } }
+                if (instanceMutex != null) { try { instanceMutex.Dispose(); } catch { } }
+            }
         }
 
         // ---------------------------------------------------------- 开机自启
@@ -616,8 +634,7 @@ namespace InphicBatteryTray
 
         static void Quit()
         {
-            running = false;
-            if (tray != null) { tray.Visible = false; tray.Dispose(); }
+            // [PATCH] 资源统一交给 Main 的 finally 释放，这里不再重复 Dispose
             Application.Exit();
         }
 
@@ -969,11 +986,12 @@ namespace InphicBatteryTray
             lock (sync)
             {
                 DeviceState st;
-                if (!states.TryGetValue(label, out st))
+                // [PATCH] 按接口路径做键。原来用产品名当键，两只同型号接收器会互相覆盖。
+                if (!states.TryGetValue(dev.Path, out st))
                 {
                     st = new DeviceState();
                     st.Label = label;
-                    states[label] = st;
+                    states[dev.Path] = st;
                 }
                 if (st.LastSeen != DateTime.MinValue)
                     st.LastIntervalMs = (now - st.LastSeen).TotalMilliseconds;
@@ -1010,7 +1028,10 @@ namespace InphicBatteryTray
                     IntPtr.Zero, Native.OPEN_EXISTING, Native.FILE_FLAG_OVERLAPPED, IntPtr.Zero);
             }
             if (h == Native.INVALID_HANDLE_VALUE) return;
-            Log("opened: " + label);
+            // [PATCH] 把 UsagePage / Usage / 报告长度打进日志，用于确认电量接口的真实归属
+            // （上游 PR #1 硬性要求 UsagePage==0x000A 才认 IN10，需先实测确认再决定是否照做）
+            Log(string.Format("opened: {0}  usagePage=0x{1:X4} usage=0x{2:X4}  in={3} out={4} feat={5}",
+                label, dev.UsagePage, dev.Usage, dev.InLen, dev.OutLen, dev.FeatLen));
 
             IntPtr ev = Native.CreateEventW(IntPtr.Zero, true, false, IntPtr.Zero);
             var buf = new byte[256];
@@ -1038,7 +1059,12 @@ namespace InphicBatteryTray
                     uint rc = Native.WaitForSingleObject(ev, 3000);
                     if (rc != Native.WAIT_OBJECT_0)
                     {
+                        // [PATCH] 取消是异步的：CancelIoEx 只是发请求，内核可能仍在访问
+                        // ovPtr 和 buf。必须阻塞等取消真正完成再进入下一轮，否则
+                        // finally 里释放 ovPtr 时就是 use-after-free。
                         Native.CancelIoEx(h, ovPtr);
+                        int aborted;
+                        Native.GetOverlappedResult(h, ovPtr, out aborted, true);
                         continue;
                     }
                     int got = 0;
@@ -1062,11 +1088,12 @@ namespace InphicBatteryTray
                         lock (sync)
                         {
                             DeviceState st;
-                            if (!states.TryGetValue(label, out st))
+                            // [PATCH] 同上，按接口路径做键
+                            if (!states.TryGetValue(dev.Path, out st))
                             {
                                 st = new DeviceState();
                                 st.Label = label;
-                                states[label] = st;
+                                states[dev.Path] = st;
                             }
                             st.Battery = level;
                             st.ChargeState = charge;
