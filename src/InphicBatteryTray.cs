@@ -283,6 +283,18 @@ namespace InphicBatteryTray
 
         static readonly HashSet<int> TypeCodes = new HashSet<int> { 0x95, 0x90, 0x93, 0x99, 0x98, 0x73 };
 
+        // [PATCH] IN10 的电量只在 Usage Page 0x000A 的接口上推送。
+        // 实测 KP 8K（1D57:FA65）四个接口：
+        //   0x000C/0x0001 in=3   消费者控制
+        //   0x0001/0x0080 in=2   系统控制
+        //   0x000A/0x0000 in=5   <- 电量
+        //   0xFF00/0x0001 in=64  厂商通道
+        // 加上这个条件后只打开电量接口，不再触碰键盘/厂商通道。
+        static bool IsIn10(HidInterface dev)
+        {
+            return dev.UsagePage == 0x000A && dev.InLen >= 5;
+        }
+
         const string RUN_KEY = @"Software\Microsoft\Windows\CurrentVersion\Run";
         const string RUN_NAME = "InphicBatteryTray";
 
@@ -728,6 +740,7 @@ namespace InphicBatteryTray
                 {
                     List<HidInterface> all = Reader.Enumerate();
                     var targets = new List<HidInterface>();
+                    int skippedByUsage = 0;
                     foreach (HidInterface d in all)
                     {
                         bool matched = false;
@@ -735,7 +748,15 @@ namespace InphicBatteryTray
                         {
                             if (d.Vid == c[0] && d.Pid == c[1]) { matched = true; break; }
                         }
-                        if (matched) { d.IsIn9 = false; targets.Add(d); continue; }
+                        if (matched)
+                        {
+                            // [PATCH] 只保留电量接口。原版只按 VID/PID 匹配，会把同一只鼠标的
+                            // 消费者控制(0x000C)、系统控制(0x0001)、厂商通道(0xFF00) 一并打开读取。
+                            // 实测 KP 8K：电量在 UsagePage=0x000A / usage=0x0000 / in=5。
+                            if (IsIn10(d)) { d.IsIn9 = false; targets.Add(d); }
+                            else skippedByUsage++;
+                            continue;
+                        }
 
                         if (IsIn9Vid(d.Vid))
                         {
@@ -747,8 +768,8 @@ namespace InphicBatteryTray
                             if (featOk) { d.IsIn9 = true; targets.Add(d); }
                         }
                     }
-                    Log(string.Format("enumerate: {0} hid interfaces, {1} candidates ({2} IN9)",
-                        all.Count, targets.Count, CountIn9(targets)));
+                    Log(string.Format("enumerate: {0} hid interfaces, {1} candidates ({2} IN9), {3} skipped by usage page",
+                        all.Count, targets.Count, CountIn9(targets), skippedByUsage));
 
                     foreach (HidInterface d in targets)
                     {
