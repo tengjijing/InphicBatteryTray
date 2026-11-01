@@ -1,0 +1,7 @@
+# 编译产物
+*.exe
+*.pdb
+
+# 运行时产物（tray.log 由程序在 exe 同目录生成）
+tray.log
+tray.log.icon.png

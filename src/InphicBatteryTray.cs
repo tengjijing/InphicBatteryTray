@@ -293,16 +293,38 @@ namespace InphicBatteryTray
         static System.Windows.Forms.Timer statusTimer;
 
         static readonly object sync = new object();
+        // [PATCH] 图标重绘互斥：TickStatus(UI线程) 与 UpdateTrayUI(读取线程) 都会进来
+        static readonly object trayLock = new object();
+        // [PATCH] 日志写入互斥：多个读取线程并发 AppendAllText 会互相抢占文件
+        static readonly object logLock = new object();
+        // [PATCH] 单实例互斥体
+        static Mutex instanceMutex = null;
         static readonly Dictionary<string, DeviceState> states = new Dictionary<string, DeviceState>();
         static volatile bool running = true;
         static Thread supervisor;
+
+        static int logWrites = 0;
 
         static void Log(string s)
         {
             if (logPath == null) return;
             try
             {
-                File.AppendAllText(logPath, DateTime.Now.ToString("HH:mm:ss.fff") + "  " + s + "\r\n");
+                lock (logLock)
+                {
+                    // [PATCH] 运行期也做轮转。原版只在启动时检查一次，
+                    // 而电量报文每 2 秒写一行，长期开机可涨到几十 MB。
+                    if (++logWrites % 500 == 0)
+                    {
+                        try
+                        {
+                            if (File.Exists(logPath) && new FileInfo(logPath).Length > 512 * 1024)
+                                File.Delete(logPath);
+                        }
+                        catch { }
+                    }
+                    File.AppendAllText(logPath, DateTime.Now.ToString("HH:mm:ss.fff") + "  " + s + "\r\n");
+                }
             }
             catch { }
         }
@@ -310,6 +332,24 @@ namespace InphicBatteryTray
         [STAThread]
         static void Main(string[] args)
         {
+            // [PATCH] 单实例。原版没有 Mutex，重复启动会出现多个托盘图标，
+            // 并且多个进程抢同一个 tray.log 互相干扰。
+            // 用 Local\ 前缀：同一用户会话内唯一，不同用户各自可以跑一份。
+            bool createdNew = true;
+            try
+            {
+                instanceMutex = new Mutex(true, @"Local\InphicBatteryTray.SingleInstance", out createdNew);
+            }
+            catch (Exception)
+            {
+                createdNew = true;
+            }
+            if (!createdNew)
+            {
+                if (instanceMutex != null) { instanceMutex.Dispose(); instanceMutex = null; }
+                return;
+            }
+
             logPath = Environment.GetEnvironmentVariable("INPHIC_TRAY_LOG");
             foreach (string a in args)
             {
@@ -560,15 +600,7 @@ namespace InphicBatteryTray
                     IntPtr hIcon = outp.GetHicon();
                     try
                     {
-                        // 调试：把实际生成的图标存一份，便于核对视觉
-                        if (logPath != null)
-                        {
-                            try
-                            {
-                                outp.Save(logPath + ".icon.png", ImageFormat.Png);
-                            }
-                            catch { }
-                        }
+                        // [PATCH] 移除每次重绘都往磁盘写 tray.log.icon.png 的调试代码
                         using (Icon tmp = Icon.FromHandle(hIcon))
                             return (Icon)tmp.Clone();
                     }
@@ -591,24 +623,21 @@ namespace InphicBatteryTray
 
         static void Rescan()
         {
-            List<Thread> ts = readersSnapshot();
-            lock (readerThreads) readerThreads.Clear();
-            lock (activePaths) activePaths.Clear();
-            foreach (Thread t in ts)
-            {
-                try { t.Interrupt(); } catch { }
-            }
+            // [PATCH] 原版会清空 activePaths 并对读取线程 Interrupt。
+            // 但 Interrupt 对阻塞在 P/Invoke 里的线程无效，旧线程要等到下一次
+            // 电量报文才会退出；而 activePaths 已被清空，Supervise 会立刻给同一路径
+            // 再起一条线程，旧线程退出时又把这个路径删掉 —— 每点一次就叠加一组线程和句柄。
+            // 正确做法：不杀线程，只唤醒 supervisor 让它立即重新枚举，新设备由它自己补上。
+            try { if (supervisor != null) supervisor.Interrupt(); } catch { }
         }
 
-        static List<Thread> readerThreads = new List<Thread>();
         // 已建立读取连接的接口路径，防止每轮枚举重复打开
         static readonly HashSet<string> activePaths =
             new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        static List<Thread> readersSnapshot()
-        {
-            lock (readerThreads) return new List<Thread>(readerThreads);
-        }
+        // [PATCH] 原版这里还有 readerThreads 列表和 readersSnapshot()，只服务于
+        // Rescan() 里"杀线程"的逻辑。改成唤醒 supervisor 之后两者都成了死代码，
+        // 而该列表只增不减，故一并移除。
 
         static string ChargeText(int c)
         {
@@ -726,10 +755,13 @@ namespace InphicBatteryTray
                         });
                         t.IsBackground = true;
                         t.Start();
-                        lock (readerThreads) readerThreads.Add(t);
                     }
 
                     Thread.Sleep(10000);
+                }
+                catch (ThreadInterruptedException)
+                {
+                    // [PATCH] Rescan() 的唤醒信号：立刻重新枚举，不要再等
                 }
                 catch (Exception)
                 {
@@ -982,6 +1014,10 @@ namespace InphicBatteryTray
 
             IntPtr ev = Native.CreateEventW(IntPtr.Zero, true, false, IntPtr.Zero);
             var buf = new byte[256];
+            // [PATCH] 异步 IO 期间必须固定缓冲区。原版把托管数组直接传给 overlapped ReadFile，
+            // 调用返回后数组就解 pin 了，内核仍可能在后台写入；这期间 GC 压缩堆会把数组搬走，
+            // 导致内核写到错误地址（堆损坏）。固定到整个读取循环结束为止。
+            GCHandle bufPin = GCHandle.Alloc(buf, GCHandleType.Pinned);
             var ov = new Native.OVERLAPPED();
             ov.hEvent = ev;
             IntPtr ovPtr = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(Native.OVERLAPPED)));
@@ -1053,6 +1089,7 @@ namespace InphicBatteryTray
             catch (Exception) { }
             finally
             {
+                if (bufPin.IsAllocated) bufPin.Free();   // [PATCH] 释放固定
                 Marshal.FreeHGlobal(ovPtr);
                 Native.CloseHandle(ev);
                 Native.CloseHandle(h);
@@ -1086,28 +1123,35 @@ namespace InphicBatteryTray
 
         static void RefreshTray(int level, double interval, bool offline, DateTime lastSeen)
         {
-            if (level != lastDrawnLevel || offline != lastDrawnOffline)
+            // [PATCH] 加锁。原版 TickStatus(UI 线程, 1s) 和 UpdateTrayUI(读取线程, 2s)
+            // 会并发进入这里，DrawIcon 里对同一个 srcIcon Bitmap 并发 DrawImage，
+            // GDI+ 的 Image 不是线程安全的，会偶发 "A generic error occurred in GDI+"。
+            lock (trayLock)
             {
-                Log(string.Format("tray state: level={0} offline={1}", level, offline));
-                Icon old = currentIcon;
-                currentIcon = DrawIcon(level, offline);
-                tray.Icon = currentIcon;
-                lastDrawnLevel = level;
-                lastDrawnOffline = offline;
-                if (old != null) { try { old.Dispose(); } catch { } }
+                if (level != lastDrawnLevel || offline != lastDrawnOffline)
+                {
+                    Log(string.Format("tray state: level={0} offline={1}", level, offline));
+                    Icon old = currentIcon;
+                    currentIcon = DrawIcon(level, offline);
+                    tray.Icon = currentIcon;
+                    lastDrawnLevel = level;
+                    lastDrawnOffline = offline;
+                    if (old != null) { try { old.Dispose(); } catch { } }
+                }
+
+                string tip;
+                if (level < 0)
+                    tip = "英菲克：未检测到设备";
+                else if (offline)
+                    tip = string.Format("英菲克：已断开 / 已关机（最后 {0}%，{1:HH:mm:ss}）",
+                        level, lastSeen);
+                else
+                    tip = string.Format("英菲克 电量 {0}%  ({1:F0}ms 刷新)", level, interval);
+
+                // [PATCH] NotifyIcon.Text 上限是 63 字符（szTip 64 wchar），原版写的 127 会抛异常
+                if (tip.Length > 63) tip = tip.Substring(0, 63);
+                tray.Text = tip;
             }
-
-            string tip;
-            if (level < 0)
-                tip = "英菲克：未检测到设备";
-            else if (offline)
-                tip = string.Format("英菲克：已断开 / 已关机（最后 {0}%，{1:HH:mm:ss}）",
-                    level, lastSeen);
-            else
-                tip = string.Format("英菲克 电量 {0}%  ({1:F0}ms 刷新)", level, interval);
-
-            if (tip.Length > 127) tip = tip.Substring(0, 127);
-            tray.Text = tip;
         }
 
         static void UpdateTrayUI()
@@ -1138,6 +1182,8 @@ namespace InphicBatteryTray
     class InfoPopup : Form
     {
         System.Windows.Forms.Timer lifeTimer;
+        // [PATCH] 缓存字体引用，关闭时释放（原版 new Font 后从不 Dispose，泄漏 GDI 句柄）
+        System.Drawing.Font lblFont;
         int countdown;
 
         protected override bool ShowWithoutActivation { get { return true; } }
@@ -1165,7 +1211,8 @@ namespace InphicBatteryTray
             lbl.Dock = DockStyle.Fill;
             lbl.Text = text;
             lbl.ForeColor = Color.FromArgb(236, 236, 242);
-            lbl.Font = new Font("Consolas", 9F, FontStyle.Regular, GraphicsUnit.Point);
+            lblFont = new System.Drawing.Font("Consolas", 9F, FontStyle.Regular, GraphicsUnit.Point);
+            lbl.Font = lblFont;
             lbl.TextAlign = ContentAlignment.TopLeft;
             lbl.BackColor = Color.Transparent;
             Controls.Add(lbl);
@@ -1191,6 +1238,14 @@ namespace InphicBatteryTray
             lbl.MouseLeave += leave;
             Click += delegate { Close(); };
             lbl.Click += delegate { Close(); };
+
+            // [PATCH] 关闭时停掉并释放定时器。原版 lifeTimer 从不 Stop/Dispose，
+            // 浮层关掉后仍每秒触发一次，每开一次详情就永久泄漏一个 1Hz 定时器。
+            FormClosed += delegate
+            {
+                try { lifeTimer.Stop(); lifeTimer.Dispose(); } catch { }
+                try { if (lblFont != null) { lblFont.Dispose(); lblFont = null; } } catch { }
+            };
         }
 
         public void ShowNear(Point anchor)
