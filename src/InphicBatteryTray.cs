@@ -710,33 +710,33 @@ namespace InphicBatteryTray
             string msg;
             lock (sync)
             {
-                if (states.Count == 0)
+                var sb = new System.Text.StringBuilder();
+                foreach (var kv in states)
                 {
-                    msg = "尚未收到任何电量上报。\n\n请确认：\n· 设备已连接并唤醒\n· 原程序不是独占状态（本工具为只读共享）";
-                }
-                else
-                {
-                    var sb = new System.Text.StringBuilder();
-                    foreach (var kv in states)
-                    {
-                        var d = kv.Value;
-                        bool off = (DateTime.Now - d.LastSeen).TotalMilliseconds > OfflineAfterMs;
+                    var d = kv.Value;
+                    bool off = (DateTime.Now - d.LastSeen).TotalMilliseconds > OfflineAfterMs;
 
-                        sb.AppendLine(string.IsNullOrEmpty(d.Product) ? d.Label : d.Product);
-                        sb.AppendLine("  连接方式  : " + (string.IsNullOrEmpty(d.Transport) ? "未知" : d.Transport));
-                        sb.AppendLine(string.Format("  硬件 ID   : {0:X4}:{1:X4}", d.Vid, d.Pid));
-                        if (d.TypeCode >= 0)
-                            sb.AppendLine(string.Format("  协议族    : type 0x{0:X2}", d.TypeCode));
-                        sb.AppendLine("  协议      : " + (string.IsNullOrEmpty(d.Protocol) ? "未知" : d.Protocol));
-                        sb.AppendLine("  电量      : " + d.Battery + "%");
-                        sb.AppendLine("  充电状态  : " + ChargeText(d.ChargeState));
-                        sb.AppendLine(string.Format("  刷新间隔  : {0:F0} ms", d.LastIntervalMs));
-                        sb.AppendLine(string.Format("  最后上报  : {0:HH:mm:ss}", d.LastSeen));
-                        sb.AppendLine("  当前状态  : " + (off ? "已断开 / 已关机" : "在线"));
-                        sb.AppendLine();
-                    }
-                    msg = sb.ToString();
+                    // [PATCH] 插线充电时，2.4G 那台会静默留在 states 里，它和有线的 FA93
+                    // 是同一只鼠标。此时显示"已断开 / 已关机"只会误导，直接略过。
+                    if (off && wiredCharging && d.Pid != 0xFA93) continue;
+
+                    sb.AppendLine(string.IsNullOrEmpty(d.Product) ? d.Label : d.Product);
+                    sb.AppendLine("  连接方式  : " + (string.IsNullOrEmpty(d.Transport) ? "未知" : d.Transport));
+                    sb.AppendLine(string.Format("  硬件 ID   : {0:X4}:{1:X4}", d.Vid, d.Pid));
+                    if (d.TypeCode >= 0)
+                        sb.AppendLine(string.Format("  协议族    : type 0x{0:X2}", d.TypeCode));
+                    sb.AppendLine("  协议      : " + (string.IsNullOrEmpty(d.Protocol) ? "未知" : d.Protocol));
+                    sb.AppendLine("  电量      : " + d.Battery + "%");
+                    sb.AppendLine("  充电状态  : " + ChargeText(d.ChargeState));
+                    sb.AppendLine(string.Format("  刷新间隔  : {0:F0} ms", d.LastIntervalMs));
+                    sb.AppendLine(string.Format("  最后上报  : {0:HH:mm:ss}", d.LastSeen));
+                    sb.AppendLine("  当前状态  : " + (off ? "已断开 / 已关机" : "在线"));
+                    sb.AppendLine();
                 }
+
+                msg = sb.Length == 0
+                    ? "尚未收到任何电量上报。\n\n请确认：\n· 设备已连接并唤醒\n· 原程序不是独占状态（本工具为只读共享）"
+                    : sb.ToString();
             }
             ShowInfoPopup(msg);
         }
