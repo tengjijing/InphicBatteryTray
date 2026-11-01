@@ -310,6 +310,14 @@ namespace InphicBatteryTray
             return false;
         }
 
+        // [PATCH] 有线模式：同一只鼠标插线后枚举成 1D57:FA93。
+        // 它一出现就说明鼠标在走线缆，此时 2.4G 那条推送会静默，
+        // 但不能当成"已关机"灰显——实际是在充电。
+        static bool IsWiredSibling(HidInterface dev)
+        {
+            return dev.Vid == 0x1D57 && dev.Pid == 0xFA93;
+        }
+
         const string RUN_KEY = @"Software\Microsoft\Windows\CurrentVersion\Run";
         const string RUN_NAME = "InphicBatteryTray";
 
@@ -334,6 +342,9 @@ namespace InphicBatteryTray
         static Mutex instanceMutex = null;
         static readonly Dictionary<string, DeviceState> states = new Dictionary<string, DeviceState>();
         static volatile bool running = true;
+        // [PATCH] 是否检测到「有线模式」的同款设备在线（插线充电时会出现）。
+        // 由 Supervise 每轮枚举更新，用于区分"真离线"和"插线充电导致 2.4G 静默"。
+        static volatile bool wiredCharging;
         static Thread supervisor;
 
         static int logWrites = 0;
@@ -755,8 +766,10 @@ namespace InphicBatteryTray
                 {
                     List<HidInterface> all = Reader.Enumerate();
                     // [PATCH] 诊断：已知厂商 VID 的接口，每个路径只记一次
+                    bool wiredNow = false;
                     foreach (HidInterface d in all)
                     {
+                        if (IsWiredSibling(d)) wiredNow = true;
                         if (!IsKnownVid(d.Vid)) continue;
                         bool fresh;
                         lock (probedPaths) fresh = probedPaths.Add(d.Path);
@@ -764,6 +777,11 @@ namespace InphicBatteryTray
                         Log(string.Format("iface: {0:X4}:{1:X4} usagePage=0x{2:X4} usage=0x{3:X4} in={4} out={5} feat={6}  {7}",
                             d.Vid, d.Pid, d.UsagePage, d.Usage, d.InLen, d.OutLen, d.FeatLen,
                             string.IsNullOrEmpty(d.Product) ? "(无产品名)" : d.Product));
+                    }
+                    if (wiredNow != wiredCharging)
+                    {
+                        wiredCharging = wiredNow;
+                        Log("wired charging mode: " + (wiredNow ? "ON（检测到有线设备）" : "OFF"));
                     }
                     var targets = new List<HidInterface>();
                     int skippedByUsage = 0;
@@ -1173,6 +1191,7 @@ namespace InphicBatteryTray
         static void TickStatus()
         {
             int level = -1;
+            int charge = -1;
             DateTime newest = DateTime.MinValue;
             double interval = 0;
 
@@ -1184,6 +1203,7 @@ namespace InphicBatteryTray
                     {
                         newest = kv.Value.LastSeen;
                         level = kv.Value.Battery;
+                        charge = kv.Value.ChargeState;
                         interval = kv.Value.LastIntervalMs;
                     }
                 }
@@ -1192,35 +1212,49 @@ namespace InphicBatteryTray
             bool offline = (newest == DateTime.MinValue) ||
                            ((DateTime.Now - newest).TotalMilliseconds > OfflineAfterMs);
 
-            RefreshTray(level, interval, offline, newest);
+            RefreshTray(level, interval, offline, newest, charge);
         }
 
-        static void RefreshTray(int level, double interval, bool offline, DateTime lastSeen)
+        static void RefreshTray(int level, double interval, bool offline, DateTime lastSeen, int charge)
         {
             // [PATCH] 加锁。原版 TickStatus(UI 线程, 1s) 和 UpdateTrayUI(读取线程, 2s)
             // 会并发进入这里，DrawIcon 里对同一个 srcIcon Bitmap 并发 DrawImage，
             // GDI+ 的 Image 不是线程安全的，会偶发 "A generic error occurred in GDI+"。
             lock (trayLock)
             {
-                if (level != lastDrawnLevel || offline != lastDrawnOffline)
+                // [PATCH] 插线充电时 2.4G 链路会静默，但设备还在，不能当"已关机"灰显。
+                // 此时保持正常配色 + 显示最后电量，靠 tooltip 说明是在充电。
+                // 要求 level>=0：只有"先有过上报、随后静默、同时有线设备出现"才算插线充电，
+                // 避免纯有线使用（从没收到过 2.4G 数据）被误判成一直在充电。
+                bool cable = offline && wiredCharging && level >= 0;
+                bool grey = offline && !cable;
+                if (level != lastDrawnLevel || grey != lastDrawnOffline)
                 {
-                    Log(string.Format("tray state: level={0} offline={1}", level, offline));
+                    Log(string.Format("tray state: level={0} offline={1} grey={2} cable={3}",
+                        level, offline, grey, cable));
                     Icon old = currentIcon;
-                    currentIcon = DrawIcon(level, offline);
+                    currentIcon = DrawIcon(level, grey);
                     tray.Icon = currentIcon;
                     lastDrawnLevel = level;
-                    lastDrawnOffline = offline;
+                    lastDrawnOffline = grey;
                     if (old != null) { try { old.Dispose(); } catch { } }
                 }
 
                 string tip;
-                if (level < 0)
+                if (cable)
+                    tip = string.Format("英菲克：充电中（有线，最后 {0}%）", level);
+                else if (level < 0)
                     tip = "英菲克：未检测到设备";
                 else if (offline)
                     tip = string.Format("英菲克：已断开 / 已关机（最后 {0}%，{1:HH:mm:ss}）",
                         level, lastSeen);
                 else
+                {
                     tip = string.Format("英菲克 电量 {0}%  ({1:F0}ms 刷新)", level, interval);
+                    // [PATCH] 无线充电时也把充电状态写进 tooltip（原来只有详情浮层里有）
+                    if (charge == 3) tip += "  充电中";
+                    else if (charge == 2) tip += "  已充满";
+                }
 
                 // [PATCH] NotifyIcon.Text 上限是 63 字符（szTip 64 wchar），原版写的 127 会抛异常
                 if (tip.Length > 63) tip = tip.Substring(0, 63);
@@ -1231,6 +1265,7 @@ namespace InphicBatteryTray
         static void UpdateTrayUI()
         {
             int level = -1;
+            int charge = -1;
             double interval = 0;
             DateTime newest = DateTime.MinValue;
             lock (sync)
@@ -1241,6 +1276,7 @@ namespace InphicBatteryTray
                     {
                         newest = kv.Value.LastSeen;
                         level = kv.Value.Battery;
+                        charge = kv.Value.ChargeState;
                         interval = kv.Value.LastIntervalMs;
                     }
                 }
@@ -1248,7 +1284,7 @@ namespace InphicBatteryTray
             if (level < 0) return;
 
             bool offline = ((DateTime.Now - newest).TotalMilliseconds > OfflineAfterMs);
-            RefreshTray(level, interval, offline, newest);
+            RefreshTray(level, interval, offline, newest, charge);
         }
     }
 
