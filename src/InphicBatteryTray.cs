@@ -711,14 +711,24 @@ namespace InphicBatteryTray
             lock (sync)
             {
                 var sb = new System.Text.StringBuilder();
+
+                // [PATCH] 先统计每个厂商是否有在线设备。
+                // 同一只鼠标在 2.4G 与有线两种模式下会枚举成两台不同的设备
+                // （FA65 / FA93），切换时旧的那台会静默甚至消失。只要同厂商还有
+                // 在线设备，就不该把静默的那台当成"已断开 / 已关机"单独列出来。
+                var onlineVids = new HashSet<ushort>();
+                foreach (var kv in states)
+                {
+                    if ((DateTime.Now - kv.Value.LastSeen).TotalMilliseconds <= OfflineAfterMs)
+                        onlineVids.Add(kv.Value.Vid);
+                }
+
                 foreach (var kv in states)
                 {
                     var d = kv.Value;
                     bool off = (DateTime.Now - d.LastSeen).TotalMilliseconds > OfflineAfterMs;
 
-                    // [PATCH] 插线充电时，2.4G 那台会静默留在 states 里，它和有线的 FA93
-                    // 是同一只鼠标。此时显示"已断开 / 已关机"只会误导，直接略过。
-                    if (off && wiredCharging && d.Pid != 0xFA93) continue;
+                    if (off && onlineVids.Contains(d.Vid)) continue;
 
                     sb.AppendLine(string.IsNullOrEmpty(d.Product) ? d.Label : d.Product);
                     sb.AppendLine("  连接方式  : " + (string.IsNullOrEmpty(d.Transport) ? "未知" : d.Transport));
@@ -814,6 +824,28 @@ namespace InphicBatteryTray
                     }
                     Log(string.Format("enumerate: {0} hid interfaces, {1} candidates ({2} IN9), {3} skipped by usage page",
                         all.Count, targets.Count, CountIn9(targets), skippedByUsage));
+
+                    // [PATCH] 清理已经不存在的接口状态。
+                    // 同一只鼠标插线时会多枚举出一台 FA93（有线模式），拔线后这台设备整个
+                    // 从系统里消失，但 states 里的记录不会自己走，于是详情浮层里永远多出
+                    // 一条"已断开 / 已关机"。这里按本轮枚举结果把消失的路径删掉。
+                    // 注意：只删"系统里已经不存在"的路径。接收器还插着、只是鼠标关机导致
+                    // 链路静默的情况，路径仍在枚举结果里，记录会保留并正常显示"已断开"。
+                    var presentPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    foreach (HidInterface d in all) presentPaths.Add(d.Path);
+                    var gone = new List<string>();
+                    lock (sync)
+                    {
+                        foreach (var kv in states)
+                        {
+                            if (!presentPaths.Contains(kv.Key)) gone.Add(kv.Key);
+                        }
+                        foreach (string k in gone) states.Remove(k);
+                    }
+                    foreach (string k in gone)
+                    {
+                        Log("state pruned: " + k);
+                    }
 
                     foreach (HidInterface d in targets)
                     {
