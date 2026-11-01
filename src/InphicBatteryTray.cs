@@ -318,6 +318,28 @@ namespace InphicBatteryTray
             return dev.Vid == 0x1D57 && dev.Pid == 0xFA93;
         }
 
+        // [PATCH] 同一只鼠标在 2.4G 与有线两种连接方式下会同时枚举成两台设备：
+        // 实测插线时 1D57:FA65 与 1D57:FA93 会同时在线，且都上报同一电量与充电状态。
+        // 它们不是两台设备，详情浮层要按"物理设备"折叠，否则插线后必然重复两条。
+        // 这里把有线身份 FA93 归并到 2.4G 身份 FA65 的同一组。
+        static string DeviceGroupKey(DeviceState d)
+        {
+            ushort pid = d.Pid;
+            if (d.Vid == 0x1D57 && pid == 0xFA93) pid = 0xFA65;
+            return string.Format("{0:X4}:{1:X4}", d.Vid, pid);
+        }
+
+        // [PATCH] 同组内挑一条展示。权重：在线 +2、有线模式 +1，同分再比最后上报时间。
+        // 有线优先是为了防抖：插线后 FA65 与 FA93 都在以 2s 周期上报，
+        // 若只按"谁更新"选，名字会在两个型号之间来回跳。
+        static int DeviceRank(DeviceState d, DateTime now)
+        {
+            int score = 0;
+            if ((now - d.LastSeen).TotalMilliseconds <= OfflineAfterMs) score += 2;
+            if (d.Vid == 0x1D57 && d.Pid == 0xFA93) score += 1;
+            return score;
+        }
+
         const string RUN_KEY = @"Software\Microsoft\Windows\CurrentVersion\Run";
         const string RUN_NAME = "InphicBatteryTray";
 
@@ -712,23 +734,33 @@ namespace InphicBatteryTray
             {
                 var sb = new System.Text.StringBuilder();
 
-                // [PATCH] 先统计每个厂商是否有在线设备。
-                // 同一只鼠标在 2.4G 与有线两种模式下会枚举成两台不同的设备
-                // （FA65 / FA93），切换时旧的那台会静默甚至消失。只要同厂商还有
-                // 在线设备，就不该把静默的那台当成"已断开 / 已关机"单独列出来。
-                var onlineVids = new HashSet<ushort>();
+                // [PATCH] 先按物理设备折叠。同一只鼠标的 2.4G 记录与有线记录会同时存在
+                // （插线时两台都在线，拔线后有线那台消失），只应显示一条。
+                // 同组内按 DeviceRank 取舍：在线 > 有线 > 最后上报更晚。
+                var groupOrder = new List<string>();
+                var groupBest = new Dictionary<string, DeviceState>();
+                DateTime now = DateTime.Now;
                 foreach (var kv in states)
                 {
-                    if ((DateTime.Now - kv.Value.LastSeen).TotalMilliseconds <= OfflineAfterMs)
-                        onlineVids.Add(kv.Value.Vid);
+                    DeviceState d = kv.Value;
+                    string key = DeviceGroupKey(d);
+                    DeviceState cur;
+                    if (!groupBest.TryGetValue(key, out cur))
+                    {
+                        groupOrder.Add(key);
+                        groupBest[key] = d;
+                        continue;
+                    }
+                    int dRank = DeviceRank(d, now);
+                    int cRank = DeviceRank(cur, now);
+                    if (dRank > cRank || (dRank == cRank && d.LastSeen > cur.LastSeen))
+                        groupBest[key] = d;
                 }
 
-                foreach (var kv in states)
+                foreach (string key in groupOrder)
                 {
-                    var d = kv.Value;
-                    bool off = (DateTime.Now - d.LastSeen).TotalMilliseconds > OfflineAfterMs;
-
-                    if (off && onlineVids.Contains(d.Vid)) continue;
+                    var d = groupBest[key];
+                    bool off = (now - d.LastSeen).TotalMilliseconds > OfflineAfterMs;
 
                     sb.AppendLine(string.IsNullOrEmpty(d.Product) ? d.Label : d.Product);
                     sb.AppendLine("  连接方式  : " + (string.IsNullOrEmpty(d.Transport) ? "未知" : d.Transport));
