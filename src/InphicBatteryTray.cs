@@ -275,6 +275,9 @@ namespace InphicBatteryTray
         static readonly ushort[][] Candidates = new ushort[][]
         {
             new ushort[]{0x1D57,0xFA60}, new ushort[]{0x1D57,0xFA65},
+            // [PATCH] FA93 = 同一只鼠标的「有线」模式（插线充电时枚举出来的另一个 PID）。
+            // 不认它的话，插线后 2.4G 那台停推、超时变灰，而有线这台根本没被打开。
+            new ushort[]{0x1D57,0xFA93},
             new ushort[]{0x045E,0x0095}, new ushort[]{0x045E,0x0090},
             new ushort[]{0x045E,0x0093}, new ushort[]{0x045E,0x0099},
             new ushort[]{0x045E,0x0098}, new ushort[]{0x045E,0x0273},
@@ -293,6 +296,18 @@ namespace InphicBatteryTray
         static bool IsIn10(HidInterface dev)
         {
             return dev.UsagePage == 0x000A && dev.InLen >= 5;
+        }
+
+        // [PATCH] 诊断：已知厂商 VID 的接口，每个路径首次出现时记一行，
+        // 用来确认"某只设备到底暴露了哪些接口"，插拔后新增的会再记。
+        static readonly HashSet<string> probedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        static bool IsKnownVid(ushort vid)
+        {
+            if (IsIn9Vid(vid)) return true;
+            foreach (ushort[] c in Candidates)
+                if (c[0] == vid) return true;
+            return false;
         }
 
         const string RUN_KEY = @"Software\Microsoft\Windows\CurrentVersion\Run";
@@ -739,6 +754,17 @@ namespace InphicBatteryTray
                 try
                 {
                     List<HidInterface> all = Reader.Enumerate();
+                    // [PATCH] 诊断：已知厂商 VID 的接口，每个路径只记一次
+                    foreach (HidInterface d in all)
+                    {
+                        if (!IsKnownVid(d.Vid)) continue;
+                        bool fresh;
+                        lock (probedPaths) fresh = probedPaths.Add(d.Path);
+                        if (!fresh) continue;
+                        Log(string.Format("iface: {0:X4}:{1:X4} usagePage=0x{2:X4} usage=0x{3:X4} in={4} out={5} feat={6}  {7}",
+                            d.Vid, d.Pid, d.UsagePage, d.Usage, d.InLen, d.OutLen, d.FeatLen,
+                            string.IsNullOrEmpty(d.Product) ? "(无产品名)" : d.Product));
+                    }
                     var targets = new List<HidInterface>();
                     int skippedByUsage = 0;
                     foreach (HidInterface d in all)
