@@ -1123,7 +1123,11 @@ namespace InphicBatteryTray
                     states[dev.Path] = st;
                 }
                 if (st.LastSeen != DateTime.MinValue)
-                    st.LastIntervalMs = (now - st.LastSeen).TotalMilliseconds;
+                {
+                    // [PATCH] 同 ReadLoop：跨过断连空档的间隔不是真实刷新周期
+                    double gap = (now - st.LastSeen).TotalMilliseconds;
+                    if (gap <= OfflineAfterMs) st.LastIntervalMs = gap;
+                }
 
                 bool changed = (st.Battery != lv || st.ChargeState != charge);
                 st.Battery = lv;
@@ -1211,7 +1215,12 @@ namespace InphicBatteryTray
                         DateTime now = DateTime.Now;
                         double interval = 0;
                         if (lastReport != DateTime.MinValue)
-                            interval = (now - lastReport).TotalMilliseconds;
+                        {
+                            // [PATCH] 跨过断连空档算出来的不是刷新周期。插拔线切换时会
+                            // 出现 20s+ 的假值（实测拔线后首条显示 26654ms），过滤掉。
+                            double gap = (now - lastReport).TotalMilliseconds;
+                            if (gap <= OfflineAfterMs) interval = gap;
+                        }
                         lastReport = now;
 
                         lock (sync)
