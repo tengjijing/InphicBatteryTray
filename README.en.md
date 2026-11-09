@@ -279,7 +279,7 @@ Even so, the idle cadence was dropped to one poll per minute: if the receiver do
 behalf, that is one frame per minute instead of fifteen.
 
 For reference: the IN9 path (`248A:5B2E` / `5B2F`) polls even faster at `Thread.Sleep(2500)`
-(`src/InphicBatteryTray.cs:936`), and IN10 is device-pushed every 2 s with the host sending nothing.
+(`src/InphicBatteryTray.cs:947`), and IN10 is device-pushed every 2 s with the host sending nothing.
 
 
 ---
