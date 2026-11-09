@@ -1,0 +1,61 @@
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.0.6",
+  "base_commit_sha": "ca27460a6fc81d6b9a2f0bd3a6440255d3767375",
+  "prompts": {},
+  "commit_stats": {
+    "git_diff_added_lines": 86,
+    "git_diff_deleted_lines": 15,
+    "ai_additions": 0,
+    "ai_accepted": 0,
+    "BYMC": 84,
+    "mixed_additions": 0,
+    "BYAC": 0,
+    "BYRC": 0,
+    "per_file": {
+      "README.en.md": {
+        "BYMC": [
+          "254-265",
+          "269-279",
+          "345"
+        ],
+        "BYAC": [],
+        "BYRC": []
+      },
+      "README.md": {
+        "BYMC": [
+          "262-269",
+          "273-277",
+          "330",
+          "334",
+          "362"
+        ],
+        "BYAC": [],
+        "BYRC": []
+      },
+      "src/InphicBatteryTray.cs": {
+        "BYMC": [
+          "136-145",
+          "177",
+          "669",
+          "1073-1074",
+          "1080-1086",
+          "1108-1115",
+          "1127-1134",
+          "1166",
+          "1300",
+          "1314",
+          "1320",
+          "1365",
+          "1378",
+          "1384"
+        ],
+        "BYAC": [],
+        "BYRC": []
+      }
+    }
+  },
+  "commit_timestamp": 1794214737,
+  "requirement_id": ""
+}
