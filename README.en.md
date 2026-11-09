@@ -2,7 +2,7 @@
 
 [中文](README.md) | [**English**](README.en.md)
 
-A **taskbar battery indicator** for INPHIC wireless mice. Supports both **IN10** (device pushes reports) and **IN9** (host queries a Feature Report). 
+A **taskbar battery indicator** for INPHIC wireless mice. Supports **IN10** (device pushes reports), **IN9** (host queries a Feature Report), and — added in this fork — **Valkyrie VK M3 lite** (vendor channel query).
 
 No driver patching, no DLL injection into the vendor software, no writes to the device — it only listens to the battery report the mouse already broadcasts every 2 seconds, and paints it in the notification area.
 
@@ -34,8 +34,8 @@ Windows' built-in "Bluetooth device battery" does not work for mice paired throu
 | Connection type | `USB` / `Bluetooth (BLE)` shown in details |
 | Detail popup | Non-modal, never steals focus, auto-dismisses after 4 s |
 | Autostart | Registry run key, toggleable from the tray menu |
-| Multi-device | IN10 scans 9 VID/PID pairs; IN9 scans `248A` — both generations coexist |
-| Dual protocol | IN10 listens to Input Reports; IN9 polls a Feature Report (`0x0C`) |
+| Multi-device | IN10 scans 9 VID/PID pairs; IN9 scans `248A`; VK scans `249A`/`248A` MI_02 — all coexist |
+| Triple protocol | IN10 listens to Input Reports; IN9 polls a Feature Report (`0x0C`); VK uses 33-byte Output/Input frames (`0x10`) |
 | Zero dependencies | Single exe, no .NET SDK or runtime install required |
 
 ### Tray states
@@ -180,6 +180,89 @@ Response:
 > The frame layout and response offsets come from the derivative project [InphicBatteryTray-IN9](https://github.com/MRXie-zf/InphicBatteryTray-IN9), reverse-engineered from the vendor's `Inphic IN9 GM.exe` and verified on real hardware.
 
 Device matching: `VID == 248A` with **Feature report length ≥ 33** (not MI_02). The two scan paths are independent and can run side by side.
+
+---
+
+## Valkyrie VK M3 lite (third protocol, added in this fork)
+
+Everything else — icon rendering, detail popup, autostart, offline detection — is unchanged from upstream.
+
+### Device and channel
+
+| Item | Value |
+|------|-------|
+| 2.4G receiver | `249A:5C2F` (dev_id `M220`, product `Wireless-Receiver`) |
+| Wired | `248A:5C2E` / `248A:5D2E` / `248A:5E2E` |
+| Interface | **MI_02** vendor channel of the composite device (`UsagePage 0x0001 / Usage 0x0000`) |
+| Report sizes | Input 33 / Output 33 / **Feature 0** (so no Feature query like IN9) |
+
+### Frame format (measured)
+
+Host writes an Output Report, the device answers with an Input Report; both 33 bytes:
+
+```
+[0]     0x00       Report ID (Windows needs this leading 0; the macOS tools do not)
+[1]     command
+[2]     status      0x00 ok / 0x02 device asleep (then [3] = 0xFF)
+[3]     0x01        constant
+[4]     payload length
+[5..]   payload
+[32]    checksum    = sum(bytes 5..31) & 0xFF
+```
+
+Reading the battery is a single frame: `[0]=0x00, [1]=0x10`, everything else zero.
+
+`0x10` response payload (11 bytes):
+
+| Offset | Meaning | Measured |
+|---|---|---|
+| `[0..3]` | model string | `M220` |
+| `[4..7]` | version / constant | `84 01 11 01` |
+| `[8]` | **charging flag** | `1` charging / `0` not charging |
+| `[9]` | **battery percent** | `0x3A` = 58%, `0x64` = 100% |
+| `[10]` | constant | `0x01` |
+
+```
+4D 32 32 30 84 01 11 01 00 3A 01   ->  M220, not charging, 58%
+4D 32 32 30 84 01 11 01 01 64 01   ->  M220, charging, 100%
+```
+
+> **That 100% while plugged in is not the real charge level.** Same mouse, measured twice: charging
+> it reports `... 01 64 01` (100%) the whole time, and the first frame after unplugging reads
+> `... 00 40 01` = **64%**. The percent field is pinned to 100 while on external power. So when the
+> charging flag is `1` the program **does not overwrite** the level — it only marks the state as
+> "charging" and keeps showing the last real reading (the tooltip says the 100% does not count).
+
+### Coexisting with the vendor app
+
+Opened with `FILE_SHARE_READ | FILE_SHARE_WRITE` on MI_02, so it runs alongside `VK M3 Series.exe`. Two traps, both handled:
+
+1. **A blocking `ReadFile` on the same handle makes `WriteFile` hang forever** -> two handles, one read-only, one write-only.
+2. **`HidD_SetOutputReport` reports success but the device ignores it** -> write the full 33-byte frame with `WriteFile`.
+
+### Do not blind-scan command codes
+
+`0x01-0x0F` are **write commands**: `0x03` writes the six DPI stages, `0x09` writes the six-button map. Scanning them with zero payloads wipes the mouse config (DPI drops to minimum, every click stops working). Write the original values back to recover:
+
+- Buttons: `00 09 00 01 0F` + `10 01 00 10 02 00 10 04 00 10 08 00 10 10 00 40 01 00`
+- DPI stages: `00 03 00 01 25 01` + six `(Xlo Xhi Ylo Yhi)` groups = `800/1200/2000/5000/8000/11000` (raw x 50)
+
+Read-only commands `0x10-0x17` and `0x20` are safe.
+
+### Polling
+
+VK does not push anything, so the host polls `0x10` every **4 s**; offline detection reuses the 8 s timeout (two missed frames).
+
+### Does polling wake the mouse or drain it
+
+Measured: idle for 40 s without sending a single frame, then one query — the device still answers
+instantly with `status=0x00`, it never went to sleep; another 25 s later it is still online (only
+payload byte 11 went `01` -> `00`). With the 2.4G receiver connected it simply does not deep-sleep,
+so the 4 s poll costs nothing extra — 33 bytes per frame.
+
+For reference: the IN9 path (`248A:5B2E` / `5B2F`) polls even faster at `Thread.Sleep(2500)`
+(`src/InphicBatteryTray.cs:936`), and IN10 is device-pushed every 2 s with the host sending nothing.
+
 
 ---
 

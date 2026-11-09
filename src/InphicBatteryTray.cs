@@ -143,6 +143,7 @@ namespace InphicBatteryTray
         public string Product;
         public string Transport;   // USB / 蓝牙
         public bool IsIn9;         // IN9 系列：需要主动查询
+        public bool IsVk;          // 瓦尔基里 VK 系列：走 mi_02 厂商通道查询
         public int InLen;          // 输入报告长度
         public int OutLen;         // 输出报告长度
         public int FeatLen;        // Feature 报告长度
@@ -155,7 +156,9 @@ namespace InphicBatteryTray
         public double LastIntervalMs;
         public DateTime LastSeen = DateTime.MinValue;
         public int ChargeState = -1;   // 1 正常 / 2 已满 / 3 充电
-        public string Protocol;        // "IN10 push" / "IN9 query"
+        public string Protocol;        // "IN10 push" / "IN9 query" / "VK query"
+        public string Brand = "英菲克"; // 托盘文字里的品牌名
+        public bool Sleeping;          // 设备回应了但处于休眠（电量沿用上次值）
         public string Product;
         public ushort Vid;
         public ushort Pid;
@@ -296,6 +299,7 @@ namespace InphicBatteryTray
         static readonly Dictionary<string, DeviceState> states = new Dictionary<string, DeviceState>();
         static volatile bool running = true;
         static Thread supervisor;
+        static Mutex instanceMutex;
 
         static void Log(string s)
         {
@@ -329,13 +333,28 @@ namespace InphicBatteryTray
             }
             Log("=== start ===");
 
+            // 单实例：已有实例在跑就直接退出，避免任务栏出现两个图标、两个轮询线程
+            bool createdNew;
+            instanceMutex = new Mutex(true, "InphicBatteryTray_SingleInstance", out createdNew);
+            if (!createdNew)
+            {
+                Log("another instance is already running — exit");
+                try
+                {
+                    MessageBox.Show("鼠标电量托盘已经在运行了。\r\n\r\n图标在任务栏右下角；如果看不到，点一下「^」展开隐藏的图标。",
+                        "InphicBatteryTray", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+                catch { }
+                return;
+            }
+
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
 
             LoadIconSource();
 
             tray = new NotifyIcon();
-            tray.Text = "英菲克 电量：搜索设备中…";
+            tray.Text = "鼠标电量：搜索设备中…";
             tray.Icon = DrawIcon(-1, true);
             tray.Visible = true;
 
@@ -639,6 +658,7 @@ namespace InphicBatteryTray
                         bool off = (DateTime.Now - d.LastSeen).TotalMilliseconds > OfflineAfterMs;
 
                         sb.AppendLine(string.IsNullOrEmpty(d.Product) ? d.Label : d.Product);
+                        sb.AppendLine("  品牌      : " + (string.IsNullOrEmpty(d.Brand) ? "英菲克" : d.Brand));
                         sb.AppendLine("  连接方式  : " + (string.IsNullOrEmpty(d.Transport) ? "未知" : d.Transport));
                         sb.AppendLine(string.Format("  硬件 ID   : {0:X4}:{1:X4}", d.Vid, d.Pid));
                         if (d.TypeCode >= 0)
@@ -691,6 +711,16 @@ namespace InphicBatteryTray
                         }
                         if (matched) { d.IsIn9 = false; targets.Add(d); continue; }
 
+                        // 瓦尔基里 VK 系列：mi_02 厂商通道，33 字节输入/输出报告，无 Feature 报告
+                        if (IsVkCandidate(d))
+                        {
+                            d.IsVk = true;
+                            Log(string.Format("VK iface: in={0} out={1} feat={2} {3}  <- candidate",
+                                d.InLen, d.OutLen, d.FeatLen, d.Product));
+                            targets.Add(d);
+                            continue;
+                        }
+
                         if (IsIn9Vid(d.Vid))
                         {
                             bool featOk = d.FeatLen >= 33;
@@ -701,8 +731,8 @@ namespace InphicBatteryTray
                             if (featOk) { d.IsIn9 = true; targets.Add(d); }
                         }
                     }
-                    Log(string.Format("enumerate: {0} hid interfaces, {1} candidates ({2} IN9)",
-                        all.Count, targets.Count, CountIn9(targets)));
+                    Log(string.Format("enumerate: {0} hid interfaces, {1} candidates ({2} IN9, {3} VK)",
+                        all.Count, targets.Count, CountIn9(targets), CountVk(targets)));
 
                     foreach (HidInterface d in targets)
                     {
@@ -716,7 +746,8 @@ namespace InphicBatteryTray
                         {
                             try
                             {
-                                if (dd.IsIn9) In9QueryLoop(dd);
+                                if (dd.IsVk) VkQueryLoop(dd);
+                                else if (dd.IsIn9) In9QueryLoop(dd);
                                 else ReadLoop(dd);
                             }
                             finally
@@ -950,6 +981,8 @@ namespace InphicBatteryTray
                 st.Battery = lv;
                 st.ChargeState = charge;
                 st.Protocol = "IN9 query";
+                st.Brand = "英菲克";
+                st.Sleeping = false;
                 st.LastSeen = now;
                 st.Product = dev.Product;
                 st.Vid = dev.Vid;
@@ -958,6 +991,163 @@ namespace InphicBatteryTray
 
                 if (changed || dump)
                     Log("IN9 battery " + lv + "%  charge=" + charge + "  [" + dev.Product + "]");
+            }
+            UpdateTrayUI();
+        }
+
+        // ---------------------------------------------------------- 瓦尔基里 VK（mi_02 主动查询）
+
+        // VK M220 固件协议（实测 VK M3 lite，2.4G 接收器 249A:5C2F）
+        //   通道：mi_02 厂商接口，输入/输出报告均为 33 字节，无 Feature 报告
+        //   请求：00 <cmd> 00 00 …（33 字节：ReportID 0 + 命令码 + 全 0 载荷 + 校验和 0）
+        //   响应：00 <cmd> <status> 01 <len> <payload…> [32]=校验和
+        //         status=0x00 成功；0x02 设备休眠（此时 [3]=0xFF）
+        //         校验和 = sum(byte[5..31]) & 0xFF
+        //   电量：cmd 0x10 的 payload[8]=充电标志(1=充电中)、payload[9]=电量百分比
+        const int VkFrameLen = 33;
+        const byte VkCmdInfo = 0x10;
+
+        static bool IsVkCandidate(HidInterface d)
+        {
+            if (d.Vid != 0x249A && d.Vid != 0x248A) return false;
+            string p = d.Path == null ? "" : d.Path.ToLowerInvariant();
+            if (p.IndexOf("mi_02", StringComparison.Ordinal) < 0) return false;
+            // 必须是有 33 字节输出报告的厂商通道，且不是 Feature 通道（否则归 IN9）
+            return d.OutLen >= VkFrameLen && (d.InLen >= VkFrameLen || d.InLen == 0);
+        }
+
+        static int CountVk(List<HidInterface> list)
+        {
+            int n = 0;
+            foreach (HidInterface d in list) if (d.IsVk) n++;
+            return n;
+        }
+
+        static byte[] BuildVkRequest(byte cmd)
+        {
+            byte[] f = new byte[VkFrameLen];
+            f[0] = 0x00;     // 报告 ID
+            f[1] = cmd;      // 命令码
+            // 其余全 0：载荷为空，校验和 sum([5..31]) 自然为 0
+            return f;
+        }
+
+        static void VkQueryLoop(HidInterface dev)
+        {
+            string label = string.Format("{0:X4}:{1:X4}", dev.Vid, dev.Pid);
+            if (!string.IsNullOrEmpty(dev.Product)) label = dev.Product + " [" + label + "]";
+
+            // 两个句柄：读句柄只收上报（OVERLAPPED 带超时），写句柄只发请求
+            // 同一句柄上挂着阻塞 ReadFile 时 WriteFile 会永久卡住，必须分开
+            IntPtr hr = Native.CreateFileW(dev.Path, Native.GENERIC_READ,
+                Native.FILE_SHARE_READ | Native.FILE_SHARE_WRITE,
+                IntPtr.Zero, Native.OPEN_EXISTING, Native.FILE_FLAG_OVERLAPPED, IntPtr.Zero);
+            IntPtr hw = Native.CreateFileW(dev.Path, Native.GENERIC_WRITE,
+                Native.FILE_SHARE_READ | Native.FILE_SHARE_WRITE,
+                IntPtr.Zero, Native.OPEN_EXISTING, 0, IntPtr.Zero);
+            if (hr == Native.INVALID_HANDLE_VALUE || hw == Native.INVALID_HANDLE_VALUE)
+            {
+                Log("VK open FAILED err=" + Marshal.GetLastWin32Error());
+                if (hr != Native.INVALID_HANDLE_VALUE) Native.CloseHandle(hr);
+                if (hw != Native.INVALID_HANDLE_VALUE) Native.CloseHandle(hw);
+                return;
+            }
+            Log(string.Format("VK opened OK: {0}  in={1} out={2} feat={3}",
+                label, dev.InLen, dev.OutLen, dev.FeatLen));
+
+            byte[] req = BuildVkRequest(VkCmdInfo);
+            byte[] buf = new byte[256];
+            int polls = 0;
+            int failStreak = 0;
+
+            try
+            {
+                while (running)
+                {
+                    int wrote = 0;
+                    bool ok = Native.WriteFile(hw, req, req.Length, out wrote, IntPtr.Zero);
+                    polls++;
+                    if (!ok)
+                    {
+                        Log("VK write FAILED err=" + Marshal.GetLastWin32Error());
+                        if (++failStreak >= 5) { Log("VK give up this interface"); break; }
+                        Thread.Sleep(2000);
+                        continue;
+                    }
+                    failStreak = 0;
+
+                    // 设备正常 1ms 内回帧；读两轮覆盖偶发分片
+                    for (int i = 0; i < 2 && running; i++)
+                    {
+                        Array.Clear(buf, 0, buf.Length);
+                        int got = HidReadTimeout(hr, buf, 400);
+                        if (got <= 0) break;
+                        AcceptVk(dev, label, buf, got, polls <= 3);
+                    }
+
+                    Thread.Sleep(4000);
+                }
+            }
+            catch (ThreadInterruptedException) { }
+            catch (Exception ex) { Log("VK loop exception: " + ex.Message); }
+            finally
+            {
+                Native.CloseHandle(hr);
+                Native.CloseHandle(hw);
+            }
+        }
+
+        static void AcceptVk(HidInterface dev, string label, byte[] buf, int got, bool dump)
+        {
+            // 响应帧：00 <cmd> <status> 01 <len> <payload…>
+            if (got < 5) return;
+            if (buf[0] != 0x00 || buf[1] != VkCmdInfo) return;
+
+            int status = buf[2];
+            int len = buf[4];
+            bool success = (status == 0x00) && len >= 10 && got >= 5 + len;
+
+            DateTime now = DateTime.Now;
+            lock (sync)
+            {
+                DeviceState st;
+                if (!states.TryGetValue(label, out st))
+                {
+                    st = new DeviceState();
+                    st.Label = label;
+                    states[label] = st;
+                }
+                if (st.LastSeen != DateTime.MinValue)
+                    st.LastIntervalMs = (now - st.LastSeen).TotalMilliseconds;
+
+                st.Product = dev.Product;
+                st.Vid = dev.Vid;
+                st.Pid = dev.Pid;
+                st.Transport = dev.Transport;
+                st.Protocol = "VK query";
+                st.Brand = "瓦尔基里";
+                st.LastSeen = now;          // 收到回帧（哪怕是休眠帧）就说明设备在线
+
+                if (success)
+                {
+                    int lv = buf[5 + 9];
+                    bool charging = (buf[5 + 8] == 1);
+                    if (lv >= 0 && lv <= 100)
+                    {
+                        st.ChargeState = charging ? 3 : 1;
+                        // 实测：插上充电线后设备固定上报 100%，那不是真实容量
+                        // （拔线瞬间读到 64%）。所以充电期间沿用最后一次非充电读数。
+                        if (!charging || st.Battery < 0) st.Battery = lv;
+                        st.Sleeping = false;
+                        if (dump || st.LastIntervalMs <= 0)
+                            Log("VK battery " + lv + "%  charging=" + charging + "  raw=" + Hex(buf, got));
+                    }
+                }
+                else
+                {
+                    st.Sleeping = true;     // 休眠/待机：沿用最后一次电量
+                    if (dump) Log("VK status=0x" + status.ToString("X2") + "  raw=" + Hex(buf, got));
+                }
             }
             UpdateTrayUI();
         }
@@ -1035,6 +1225,8 @@ namespace InphicBatteryTray
                             st.Battery = level;
                             st.ChargeState = charge;
                             st.Protocol = "IN10 push";
+                            st.Brand = "英菲克";
+                            st.Sleeping = false;
                             st.LastSeen = now;
                             st.Product = dev.Product;
                             st.Vid = dev.Vid;
@@ -1064,6 +1256,9 @@ namespace InphicBatteryTray
             int level = -1;
             DateTime newest = DateTime.MinValue;
             double interval = 0;
+            string brand = "英菲克";
+            bool sleeping = false;
+            bool charging = false;
 
             lock (sync)
             {
@@ -1074,6 +1269,9 @@ namespace InphicBatteryTray
                         newest = kv.Value.LastSeen;
                         level = kv.Value.Battery;
                         interval = kv.Value.LastIntervalMs;
+                        brand = kv.Value.Brand;
+                        sleeping = kv.Value.Sleeping;
+                        charging = (kv.Value.ChargeState == 3);
                     }
                 }
             }
@@ -1081,11 +1279,13 @@ namespace InphicBatteryTray
             bool offline = (newest == DateTime.MinValue) ||
                            ((DateTime.Now - newest).TotalMilliseconds > OfflineAfterMs);
 
-            RefreshTray(level, interval, offline, newest);
+            RefreshTray(level, interval, offline, newest, brand, sleeping, charging);
         }
 
-        static void RefreshTray(int level, double interval, bool offline, DateTime lastSeen)
+        static void RefreshTray(int level, double interval, bool offline, DateTime lastSeen,
+            string brand, bool sleeping, bool charging)
         {
+            if (string.IsNullOrEmpty(brand)) brand = "英菲克";
             if (level != lastDrawnLevel || offline != lastDrawnOffline)
             {
                 Log(string.Format("tray state: level={0} offline={1}", level, offline));
@@ -1099,12 +1299,16 @@ namespace InphicBatteryTray
 
             string tip;
             if (level < 0)
-                tip = "英菲克：未检测到设备";
+                tip = brand + "：未检测到设备";
             else if (offline)
-                tip = string.Format("英菲克：已断开 / 已关机（最后 {0}%，{1:HH:mm:ss}）",
-                    level, lastSeen);
+                tip = string.Format("{0}：已断开 / 已关机（最后 {1}%，{2:HH:mm:ss}）",
+                    brand, level, lastSeen);
+            else if (charging)
+                tip = string.Format("{0} 电量 {1}%（充电中，设备此刻上报的 100% 不作数）", brand, level);
+            else if (sleeping)
+                tip = string.Format("{0} 电量 {1}%（设备休眠，沿用上次读数）", brand, level);
             else
-                tip = string.Format("英菲克 电量 {0}%  ({1:F0}ms 刷新)", level, interval);
+                tip = string.Format("{0} 电量 {1}%  ({2:F0}ms 刷新)", brand, level, interval);
 
             if (tip.Length > 127) tip = tip.Substring(0, 127);
             tray.Text = tip;
@@ -1115,6 +1319,9 @@ namespace InphicBatteryTray
             int level = -1;
             double interval = 0;
             DateTime newest = DateTime.MinValue;
+            string brand = "英菲克";
+            bool sleeping = false;
+            bool charging = false;
             lock (sync)
             {
                 foreach (var kv in states)
@@ -1124,13 +1331,16 @@ namespace InphicBatteryTray
                         newest = kv.Value.LastSeen;
                         level = kv.Value.Battery;
                         interval = kv.Value.LastIntervalMs;
+                        brand = kv.Value.Brand;
+                        sleeping = kv.Value.Sleeping;
+                        charging = (kv.Value.ChargeState == 3);
                     }
                 }
             }
             if (level < 0) return;
 
             bool offline = ((DateTime.Now - newest).TotalMilliseconds > OfflineAfterMs);
-            RefreshTray(level, interval, offline, newest);
+            RefreshTray(level, interval, offline, newest, brand, sleeping, charging);
         }
     }
 
