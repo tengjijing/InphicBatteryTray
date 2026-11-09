@@ -251,14 +251,32 @@ Read-only commands `0x10-0x17` and `0x20` are safe.
 
 ### Polling
 
-VK does not push anything, so the host polls `0x10` every **4 s**; offline detection reuses the 8 s timeout (two missed frames).
+VK does not push anything, so the host has to poll. The interval follows whether you are actually using the
+machine:
+
+| System idle | Poll interval | Why |
+|-------------|---------------|-----|
+| < 60 s | 4 s | You are moving the mouse, so it is awake anyway |
+| >= 60 s | 60 s | Let it honour its own sleep setting instead of waking it four times a minute |
+
+`VkQueryLoop()` reads the idle time with `GetLastInputInfo` (`IdleSeconds()`) and only sends when `nextPoll` is
+due; while waiting it wakes every 250 ms, so the moment you touch the mouse it polls immediately and returns to
+the 4 s cadence. The offline threshold follows at 150 s (`DeviceState.OfflineMs`), otherwise a 60 s poll would be
+misread as a disconnect.
 
 ### Does polling wake the mouse or drain it
 
-Measured: idle for 40 s without sending a single frame, then one query — the device still answers
-instantly with `status=0x00`, it never went to sleep; another 25 s later it is still online (only
-payload byte 11 went `01` -> `00`). With the 2.4G receiver connected it simply does not deep-sleep,
-so the 4 s poll costs nothing extra — 33 bytes per frame.
+**It does sleep, and `0x10` cannot tell you.** After a while idle the configuration commands (`0x11` buttons /
+`0x13` DPI / `0x17` power management) stop answering altogether, while `0x10` still replies instantly — that reply
+is most likely the receiver answering from its cache. Measured: polling every 4 s for 90 s never woke it (`0x11`
+stayed silent); 90 s of complete silence gave the same result.
+
+So "is it awake" must be judged by whether a configuration command returns real data (`status=0x00` with an
+18-byte payload). `0x10` cannot distinguish the two states — an early measurement of mine concluded the opposite
+from the same mistake and has been retracted.
+
+Even so, the idle cadence was dropped to one poll per minute: if the receiver does keep answering on the device's
+behalf, that is one frame per minute instead of fifteen.
 
 For reference: the IN9 path (`248A:5B2E` / `5B2F`) polls even faster at `Thread.Sleep(2500)`
 (`src/InphicBatteryTray.cs:936`), and IN10 is device-pushed every 2 s with the host sending nothing.
@@ -324,7 +342,7 @@ This was a hard constraint during development too: every diagnostic sniffer used
 1. **Model coverage**: IN10 verified on `Inphic KP 8K`; IN9 implemented against the hardware-verified protocol of the IN9 refresh (`248A:5B2E` / `248A:5B2F`). Other INPHIC models (IN10 Pro / IN6 …) are unverified and may not read.
 2. **Battery resolution is 1% at the hardware level.** No decimals, no voltage, no health data. Showing `87.3%` would require fabricating it through interpolation, which this project deliberately does not do.
 3. **Reporting rate cannot be configured.** IN10's 2 s cadence is baked into firmware; IN9's 2.5 s poll interval is chosen by the app. Neither generation exposes a "set interval" command.
-4. **Offline is a guess via timeout** (8 s), because the device sends nothing on power-off. A mouse that merely dozed off could be misreported as offline.
+4. **Offline is a guess via timeout** (8 s for IN10/IN9, 150 s for VK — see `DeviceState.OfflineMs`), because the device sends nothing on power-off. A mouse that merely dozed off could be misreported as offline.
 5. Fine badge/detail is lost at 16×16 — that is the physical limit of tray icons.
 
 ### Battery not detected?

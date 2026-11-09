@@ -133,6 +133,16 @@ namespace InphicBatteryTray
 
         [DllImport("user32.dll", SetLastError = true)]
         public static extern bool DestroyIcon(IntPtr hIcon);
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct LASTINPUTINFO
+        {
+            public uint cbSize;
+            public uint dwTime;
+        }
+
+        [DllImport("user32.dll")]
+        public static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
     }
 
     class HidInterface
@@ -164,6 +174,7 @@ namespace InphicBatteryTray
         public ushort Pid;
         public string Transport;
         public int TypeCode = -1;
+        public int OfflineMs = 8000;   // 该设备的离线判定阈值（VK 轮询会降频，阈值也放宽）
     }
 
     class Reader
@@ -655,7 +666,7 @@ namespace InphicBatteryTray
                     foreach (var kv in states)
                     {
                         var d = kv.Value;
-                        bool off = (DateTime.Now - d.LastSeen).TotalMilliseconds > OfflineAfterMs;
+                        bool off = (DateTime.Now - d.LastSeen).TotalMilliseconds > d.OfflineMs;
 
                         sb.AppendLine(string.IsNullOrEmpty(d.Product) ? d.Label : d.Product);
                         sb.AppendLine("  品牌      : " + (string.IsNullOrEmpty(d.Brand) ? "英菲克" : d.Brand));
@@ -1059,11 +1070,20 @@ namespace InphicBatteryTray
             byte[] buf = new byte[256];
             int polls = 0;
             int failStreak = 0;
+            DateTime nextPoll = DateTime.MinValue;
+            bool wasIdle = false;
 
             try
             {
                 while (running)
                 {
+                    if (DateTime.Now < nextPoll)
+                    {
+                        // 等待期间只睡 250ms：你一重新动鼠标就立刻补一枪、恢复 4 秒节奏
+                        if (wasIdle && IdleSeconds() < 60) nextPoll = DateTime.Now;
+                        Thread.Sleep(250);
+                        continue;
+                    }
                     int wrote = 0;
                     bool ok = Native.WriteFile(hw, req, req.Length, out wrote, IntPtr.Zero);
                     polls++;
@@ -1085,7 +1105,14 @@ namespace InphicBatteryTray
                         AcceptVk(dev, label, buf, got, polls <= 3);
                     }
 
-                    Thread.Sleep(4000);
+                    int idle = IdleSeconds();
+                    bool nowIdle = idle >= 60;
+                    if (nowIdle != wasIdle)
+                        Log(nowIdle
+                            ? "VK idle " + idle + "s: 轮询降到 60 秒一次（让设备按自己的休眠设置睡）"
+                            : "VK 用户回来了: 轮询恢复到 4 秒一次");
+                    wasIdle = nowIdle;
+                    nextPoll = DateTime.Now.AddMilliseconds(nowIdle ? 60000 : 4000);
                 }
             }
             catch (ThreadInterruptedException) { }
@@ -1095,6 +1122,16 @@ namespace InphicBatteryTray
                 Native.CloseHandle(hr);
                 Native.CloseHandle(hw);
             }
+        }
+
+        // 系统闲置秒数：用来决定轮询要不要降频，避免在设备该休眠的时候持续打扰
+        static int IdleSeconds()
+        {
+            Native.LASTINPUTINFO li = new Native.LASTINPUTINFO();
+            li.cbSize = (uint)Marshal.SizeOf(typeof(Native.LASTINPUTINFO));
+            if (!Native.GetLastInputInfo(ref li)) return 0;
+            uint idle = unchecked((uint)Environment.TickCount) - li.dwTime;
+            return (int)(idle / 1000);
         }
 
         static void AcceptVk(HidInterface dev, string label, byte[] buf, int got, bool dump)
@@ -1126,6 +1163,7 @@ namespace InphicBatteryTray
                 st.Transport = dev.Transport;
                 st.Protocol = "VK query";
                 st.Brand = "瓦尔基里";
+                st.OfflineMs = 150000;   // 空闲时轮询降到 1 分钟一次，判定也要跟着放宽
                 st.LastSeen = now;          // 收到回帧（哪怕是休眠帧）就说明设备在线
 
                 if (success)
@@ -1259,6 +1297,7 @@ namespace InphicBatteryTray
             string brand = "英菲克";
             bool sleeping = false;
             bool charging = false;
+            int offlineMs = OfflineAfterMs;
 
             lock (sync)
             {
@@ -1272,12 +1311,13 @@ namespace InphicBatteryTray
                         brand = kv.Value.Brand;
                         sleeping = kv.Value.Sleeping;
                         charging = (kv.Value.ChargeState == 3);
+                        offlineMs = kv.Value.OfflineMs;
                     }
                 }
             }
 
             bool offline = (newest == DateTime.MinValue) ||
-                           ((DateTime.Now - newest).TotalMilliseconds > OfflineAfterMs);
+                           ((DateTime.Now - newest).TotalMilliseconds > offlineMs);
 
             RefreshTray(level, interval, offline, newest, brand, sleeping, charging);
         }
@@ -1322,6 +1362,7 @@ namespace InphicBatteryTray
             string brand = "英菲克";
             bool sleeping = false;
             bool charging = false;
+            int offlineMs = OfflineAfterMs;
             lock (sync)
             {
                 foreach (var kv in states)
@@ -1334,12 +1375,13 @@ namespace InphicBatteryTray
                         brand = kv.Value.Brand;
                         sleeping = kv.Value.Sleeping;
                         charging = (kv.Value.ChargeState == 3);
+                        offlineMs = kv.Value.OfflineMs;
                     }
                 }
             }
             if (level < 0) return;
 
-            bool offline = ((DateTime.Now - newest).TotalMilliseconds > OfflineAfterMs);
+            bool offline = ((DateTime.Now - newest).TotalMilliseconds > offlineMs);
             RefreshTray(level, interval, offline, newest, brand, sleeping, charging);
         }
     }
