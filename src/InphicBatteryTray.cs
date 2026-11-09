@@ -301,6 +301,7 @@ namespace InphicBatteryTray
         static MenuItem autoItem;
         static int lastDrawnLevel = -999;
         static bool lastDrawnOffline = true;
+        static bool lastDrawnCharging = false;
 
         // 超过该时长没收到电量报告即视为离线（设备上报周期约 2s）
         const int OfflineAfterMs = 8000;
@@ -366,7 +367,7 @@ namespace InphicBatteryTray
 
             tray = new NotifyIcon();
             tray.Text = "鼠标电量：搜索设备中…";
-            tray.Icon = DrawIcon(-1, true);
+            tray.Icon = DrawIcon(-1, true, false);
             tray.Visible = true;
 
             var menu = new ContextMenu();
@@ -474,6 +475,9 @@ namespace InphicBatteryTray
             catch (Exception ex) { Log("icon load error: " + ex.Message); }
         }
 
+        // 充电中：整条填蓝，不表示容量（设备充电时不报电量）
+        static Color ChargingColor { get { return Color.FromArgb(0x2F, 0x9B, 0xFF); } }
+
         static Color StatusColor(int lv)
         {
             if (lv <= 15) return Color.FromArgb(255, 70, 70);
@@ -513,7 +517,7 @@ namespace InphicBatteryTray
 
         // 按电量从下往上填充鼠标主体；外圈实心描边，滚轮/顶部保持原色
         // offline=true 时整体灰显（设备关机 / 断连 / 长时间未上报）
-        static Icon DrawIcon(int level, bool offline)
+        static Icon DrawIcon(int level, bool offline, bool charging)
         {
             Size sz = SystemInformation.SmallIconSize;
             if (sz.Width < 16) sz = new Size(16, 16);
@@ -533,8 +537,8 @@ namespace InphicBatteryTray
 
                 using (Bitmap outp = new Bitmap(w, h, PixelFormat.Format32bppArgb))
                 {
-                    double fillTop = h * (1.0 - Math.Max(0, Math.Min(100, level)) / 100.0);
-                    Color st = StatusColor(level);
+                    double fillTop = charging ? 0 : h * (1.0 - Math.Max(0, Math.Min(100, level)) / 100.0);
+                    Color st = charging ? ChargingColor : StatusColor(level);
                     Color empty = Color.FromArgb(100, 100, 110);
                     Color outline = OutlineColor;
                     Color offOutline = Color.FromArgb(52, 52, 62);
@@ -675,7 +679,9 @@ namespace InphicBatteryTray
                         if (d.TypeCode >= 0)
                             sb.AppendLine(string.Format("  协议族    : type 0x{0:X2}", d.TypeCode));
                         sb.AppendLine("  协议      : " + (string.IsNullOrEmpty(d.Protocol) ? "未知" : d.Protocol));
-                        sb.AppendLine("  电量      : " + d.Battery + "%");
+                        sb.AppendLine(d.ChargeState == 3
+                            ? "  电量      : 充电中（设备不报容量）"
+                            : "  电量      : " + d.Battery + "%");
                         sb.AppendLine("  充电状态  : " + ChargeText(d.ChargeState));
                         sb.AppendLine(string.Format("  刷新间隔  : {0:F0} ms", d.LastIntervalMs));
                         sb.AppendLine(string.Format("  最后上报  : {0:HH:mm:ss}", d.LastSeen));
@@ -1326,14 +1332,15 @@ namespace InphicBatteryTray
             string brand, bool sleeping, bool charging)
         {
             if (string.IsNullOrEmpty(brand)) brand = "英菲克";
-            if (level != lastDrawnLevel || offline != lastDrawnOffline)
+            if (level != lastDrawnLevel || offline != lastDrawnOffline || charging != lastDrawnCharging)
             {
-                Log(string.Format("tray state: level={0} offline={1}", level, offline));
+                Log(string.Format("tray state: level={0} offline={1} charging={2}", level, offline, charging));
                 Icon old = currentIcon;
-                currentIcon = DrawIcon(level, offline);
+                currentIcon = DrawIcon(level, offline, charging);
                 tray.Icon = currentIcon;
                 lastDrawnLevel = level;
                 lastDrawnOffline = offline;
+                lastDrawnCharging = charging;
                 if (old != null) { try { old.Dispose(); } catch { } }
             }
 
@@ -1344,7 +1351,7 @@ namespace InphicBatteryTray
                 tip = string.Format("{0}：已断开 / 已关机（最后 {1}%，{2:HH:mm:ss}）",
                     brand, level, lastSeen);
             else if (charging)
-                tip = string.Format("{0} 电量 {1}%（充电中，设备此刻上报的 100% 不作数）", brand, level);
+                tip = brand + "：充电中（设备不报容量）";
             else if (sleeping)
                 tip = string.Format("{0} 电量 {1}%（设备休眠，沿用上次读数）", brand, level);
             else

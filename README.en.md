@@ -43,6 +43,7 @@ Windows' built-in "Bluetooth device battery" does not work for mice paired throu
 | State | Icon | Tooltip |
 |-------|------|---------|
 | Online | Teal fill proportional to charge | `INPHIC 87% (2000ms refresh)` |
+| Charging | Solid blue, full body | `VALKYRIE: charging (device reports no capacity)` |
 | Offline | Entirely greyed out | `INPHIC: disconnected / powered off (last 87%, 21:12:03)` |
 | Not detected | Greyed out | `INPHIC: no device detected` |
 
@@ -229,9 +230,13 @@ Reading the battery is a single frame: `[0]=0x00, [1]=0x10`, everything else zer
 
 > **That 100% while plugged in is not the real charge level.** Same mouse, measured twice: charging
 > it reports `... 01 64 01` (100%) the whole time, and the first frame after unplugging reads
-> `... 00 40 01` = **64%**. The percent field is pinned to 100 while on external power. So when the
-> charging flag is `1` the program **does not overwrite** the level — it only marks the state as
-> "charging" and keeps showing the last real reading (the tooltip says the 100% does not count).
+> `... 00 40 01` = **64%**. On external power the percent field is pinned to 100 no matter how much
+> charge is left. The vendor app does not compensate either: plugged in it draws four full bars plus a
+> lightning bolt, same as a full battery (at 58–59% unplugged it draws three bars, one bar = 25%).
+>
+> So the program does not try to interpret that fake 100%: when the charging flag is `1` it switches to
+> a **solid blue charging icon**, the tooltip reads "charging (device does not report capacity)", and the
+> details panel likewise shows "charging" with no percentage. Unplug for an accurate reading.
 
 ### Coexisting with the vendor app
 
@@ -344,6 +349,7 @@ This was a hard constraint during development too: every diagnostic sniffer used
 3. **Reporting rate cannot be configured.** IN10's 2 s cadence is baked into firmware; IN9's 2.5 s poll interval is chosen by the app. Neither generation exposes a "set interval" command.
 4. **Offline is a guess via timeout** (8 s for IN10/IN9, 150 s for VK — see `DeviceState.OfflineMs`), because the device sends nothing on power-off. A mouse that merely dozed off could be misreported as offline.
 5. Fine badge/detail is lost at 16×16 — that is the physical limit of tray icons.
+6. **No real reading while charging** (VK channel only): on external power the device pins the percent field to 100 regardless of the actual level (the vendor app just draws full bars too). The tray then shows the blue charging icon without a percentage; unplug and it is accurate again.
 
 ### Battery not detected?
 
