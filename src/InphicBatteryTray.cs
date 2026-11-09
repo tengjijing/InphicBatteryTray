@@ -154,6 +154,9 @@ namespace InphicBatteryTray
         public string Transport;   // USB / 蓝牙
         public bool IsIn9;         // IN9 系列：需要主动查询
         public bool IsVk;          // 瓦尔基里 VK 系列：走 mi_02 厂商通道查询
+        // [PATCH] 采集 Usage Page / Usage，仅用于日志观测，暂不参与筛选
+        public ushort UsagePage;
+        public ushort Usage;
         public int InLen;          // 输入报告长度
         public int OutLen;         // 输出报告长度
         public int FeatLen;        // Feature 报告长度
@@ -252,6 +255,9 @@ namespace InphicBatteryTray
                                     byte[] caps = new byte[256];
                                     if (Native.HidP_GetCaps(pp, caps) == 0x00110000)
                                     {
+                                        // [PATCH] HIDP_CAPS 布局：Usage 在偏移 0，UsagePage 在偏移 2
+                                        dev.Usage = BitConverter.ToUInt16(caps, 0);
+                                        dev.UsagePage = BitConverter.ToUInt16(caps, 2);
                                         dev.InLen = BitConverter.ToUInt16(caps, 4);
                                         dev.OutLen = BitConverter.ToUInt16(caps, 6);
                                         dev.FeatLen = BitConverter.ToUInt16(caps, 8);
@@ -283,6 +289,9 @@ namespace InphicBatteryTray
         static readonly ushort[][] Candidates = new ushort[][]
         {
             new ushort[]{0x1D57,0xFA60}, new ushort[]{0x1D57,0xFA65},
+            // [PATCH] FA93 = 同一只鼠标的「有线」模式（插线充电时枚举出来的另一个 PID）。
+            // 不认它的话，插线后 2.4G 那台停推、超时变灰，而有线这台根本没被打开。
+            new ushort[]{0x1D57,0xFA93},
             new ushort[]{0x045E,0x0095}, new ushort[]{0x045E,0x0090},
             new ushort[]{0x045E,0x0093}, new ushort[]{0x045E,0x0099},
             new ushort[]{0x045E,0x0098}, new ushort[]{0x045E,0x0273},
@@ -290,6 +299,60 @@ namespace InphicBatteryTray
         };
 
         static readonly HashSet<int> TypeCodes = new HashSet<int> { 0x95, 0x90, 0x93, 0x99, 0x98, 0x73 };
+
+        // [PATCH] IN10 的电量只在 Usage Page 0x000A 的接口上推送。
+        // 实测 KP 8K（1D57:FA65）四个接口：
+        //   0x000C/0x0001 in=3   消费者控制
+        //   0x0001/0x0080 in=2   系统控制
+        //   0x000A/0x0000 in=5   <- 电量
+        //   0xFF00/0x0001 in=64  厂商通道
+        // 加上这个条件后只打开电量接口，不再触碰键盘/厂商通道。
+        static bool IsIn10(HidInterface dev)
+        {
+            return dev.UsagePage == 0x000A && dev.InLen >= 5;
+        }
+
+        // [PATCH] 诊断：已知厂商 VID 的接口，每个路径首次出现时记一行，
+        // 用来确认"某只设备到底暴露了哪些接口"，插拔后新增的会再记。
+        static readonly HashSet<string> probedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        static bool IsKnownVid(ushort vid)
+        {
+            if (IsIn9Vid(vid)) return true;
+            foreach (ushort[] c in Candidates)
+                if (c[0] == vid) return true;
+            return false;
+        }
+
+        // [PATCH] 有线模式：同一只鼠标插线后枚举成 1D57:FA93。
+        // 它一出现就说明鼠标在走线缆，此时 2.4G 那条推送会静默，
+        // 但不能当成"已关机"灰显——实际是在充电。
+        static bool IsWiredSibling(HidInterface dev)
+        {
+            return dev.Vid == 0x1D57 && dev.Pid == 0xFA93;
+        }
+
+        // [PATCH] 同一只鼠标在 2.4G 与有线两种连接方式下会同时枚举成两台设备：
+        // 实测插线时 1D57:FA65 与 1D57:FA93 会同时在线，且都上报同一电量与充电状态。
+        // 它们不是两台设备，详情浮层要按"物理设备"折叠，否则插线后必然重复两条。
+        // 这里把有线身份 FA93 归并到 2.4G 身份 FA65 的同一组。
+        static string DeviceGroupKey(DeviceState d)
+        {
+            ushort pid = d.Pid;
+            if (d.Vid == 0x1D57 && pid == 0xFA93) pid = 0xFA65;
+            return string.Format("{0:X4}:{1:X4}", d.Vid, pid);
+        }
+
+        // [PATCH] 同组内挑一条展示。权重：在线 +2、有线模式 +1，同分再比最后上报时间。
+        // 有线优先是为了防抖：插线后 FA65 与 FA93 都在以 2s 周期上报，
+        // 若只按"谁更新"选，名字会在两个型号之间来回跳。
+        static int DeviceRank(DeviceState d, DateTime now)
+        {
+            int score = 0;
+            if ((now - d.LastSeen).TotalMilliseconds <= OfflineAfterMs) score += 2;
+            if (d.Vid == 0x1D57 && d.Pid == 0xFA93) score += 1;
+            return score;
+        }
 
         const string RUN_KEY = @"Software\Microsoft\Windows\CurrentVersion\Run";
         const string RUN_NAME = "InphicBatteryTray";
@@ -308,17 +371,41 @@ namespace InphicBatteryTray
         static System.Windows.Forms.Timer statusTimer;
 
         static readonly object sync = new object();
+        // [PATCH] 图标重绘互斥：TickStatus(UI线程) 与 UpdateTrayUI(读取线程) 都会进来
+        static readonly object trayLock = new object();
+        // [PATCH] 日志写入互斥：多个读取线程并发 AppendAllText 会互相抢占文件
+        static readonly object logLock = new object();
+        // [PATCH] 单实例互斥体
+        static Mutex instanceMutex = null;
         static readonly Dictionary<string, DeviceState> states = new Dictionary<string, DeviceState>();
         static volatile bool running = true;
+        // [PATCH] 是否检测到「有线模式」的同款设备在线（插线充电时会出现）。
+        // 由 Supervise 每轮枚举更新，用于区分"真离线"和"插线充电导致 2.4G 静默"。
+        static volatile bool wiredCharging;
         static Thread supervisor;
-        static Mutex instanceMutex;
+
+        static int logWrites = 0;
 
         static void Log(string s)
         {
             if (logPath == null) return;
             try
             {
-                File.AppendAllText(logPath, DateTime.Now.ToString("HH:mm:ss.fff") + "  " + s + "\r\n");
+                lock (logLock)
+                {
+                    // [PATCH] 运行期也做轮转。原版只在启动时检查一次，
+                    // 而电量报文每 2 秒写一行，长期开机可涨到几十 MB。
+                    if (++logWrites % 500 == 0)
+                    {
+                        try
+                        {
+                            if (File.Exists(logPath) && new FileInfo(logPath).Length > 512 * 1024)
+                                File.Delete(logPath);
+                        }
+                        catch { }
+                    }
+                    File.AppendAllText(logPath, DateTime.Now.ToString("HH:mm:ss.fff") + "  " + s + "\r\n");
+                }
             }
             catch { }
         }
@@ -326,6 +413,31 @@ namespace InphicBatteryTray
         [STAThread]
         static void Main(string[] args)
         {
+            // 单实例：已有实例在跑就直接退出，避免任务栏出现两个图标、两个轮询线程。
+            // 用 Local\ 前缀：同一用户会话内唯一，不同用户各自可以跑一份。
+            // 重复启动时弹一次提示（图标在任务栏右下角 ^ 里），然后退出。
+            bool createdNew = true;
+            try
+            {
+                instanceMutex = new Mutex(true, @"Local\InphicBatteryTray.SingleInstance", out createdNew);
+            }
+            catch (Exception)
+            {
+                createdNew = true;
+            }
+            if (!createdNew)
+            {
+                if (instanceMutex != null) { instanceMutex.Dispose(); instanceMutex = null; }
+                Log("another instance is already running — exit");
+                try
+                {
+                    MessageBox.Show("鼠标电量托盘已经在运行了。\r\n\r\n图标在任务栏右下角；如果看不到，点一下「^」展开隐藏的图标。",
+                        "InphicBatteryTray", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+                catch { }
+                return;
+            }
+
             logPath = Environment.GetEnvironmentVariable("INPHIC_TRAY_LOG");
             foreach (string a in args)
             {
@@ -344,21 +456,6 @@ namespace InphicBatteryTray
                 catch { logPath = null; }
             }
             Log("=== start ===");
-
-            // 单实例：已有实例在跑就直接退出，避免任务栏出现两个图标、两个轮询线程
-            bool createdNew;
-            instanceMutex = new Mutex(true, "InphicBatteryTray_SingleInstance", out createdNew);
-            if (!createdNew)
-            {
-                Log("another instance is already running — exit");
-                try
-                {
-                    MessageBox.Show("鼠标电量托盘已经在运行了。\r\n\r\n图标在任务栏右下角；如果看不到，点一下「^」展开隐藏的图标。",
-                        "InphicBatteryTray", MessageBoxButtons.OK, MessageBoxIcon.Information);
-                }
-                catch { }
-                return;
-            }
 
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
@@ -409,7 +506,19 @@ namespace InphicBatteryTray
                 testTimer.Start();
             }
 
-            Application.Run();
+            // [PATCH] 退出时统一释放托盘图标、GDI 对象和定时器
+            try { Application.Run(); }
+            finally
+            {
+                running = false;
+                if (supervisor != null) { try { supervisor.Interrupt(); } catch { } }
+                if (statusTimer != null) statusTimer.Dispose();
+                if (popup != null) { try { popup.Dispose(); } catch { } }
+                if (tray != null) { try { tray.Visible = false; tray.Dispose(); } catch { } }
+                if (currentIcon != null) { try { currentIcon.Dispose(); } catch { } }
+                if (srcIcon != null) { try { srcIcon.Dispose(); } catch { } }
+                if (instanceMutex != null) { try { instanceMutex.Dispose(); } catch { } }
+            }
         }
 
         // ---------------------------------------------------------- 开机自启
@@ -594,15 +703,7 @@ namespace InphicBatteryTray
                     IntPtr hIcon = outp.GetHicon();
                     try
                     {
-                        // 调试：把实际生成的图标存一份，便于核对视觉
-                        if (logPath != null)
-                        {
-                            try
-                            {
-                                outp.Save(logPath + ".icon.png", ImageFormat.Png);
-                            }
-                            catch { }
-                        }
+                        // [PATCH] 移除每次重绘都往磁盘写 tray.log.icon.png 的调试代码
                         using (Icon tmp = Icon.FromHandle(hIcon))
                             return (Icon)tmp.Clone();
                     }
@@ -618,31 +719,27 @@ namespace InphicBatteryTray
 
         static void Quit()
         {
-            running = false;
-            if (tray != null) { tray.Visible = false; tray.Dispose(); }
+            // [PATCH] 资源统一交给 Main 的 finally 释放，这里不再重复 Dispose
             Application.Exit();
         }
 
         static void Rescan()
         {
-            List<Thread> ts = readersSnapshot();
-            lock (readerThreads) readerThreads.Clear();
-            lock (activePaths) activePaths.Clear();
-            foreach (Thread t in ts)
-            {
-                try { t.Interrupt(); } catch { }
-            }
+            // [PATCH] 原版会清空 activePaths 并对读取线程 Interrupt。
+            // 但 Interrupt 对阻塞在 P/Invoke 里的线程无效，旧线程要等到下一次
+            // 电量报文才会退出；而 activePaths 已被清空，Supervise 会立刻给同一路径
+            // 再起一条线程，旧线程退出时又把这个路径删掉 —— 每点一次就叠加一组线程和句柄。
+            // 正确做法：不杀线程，只唤醒 supervisor 让它立即重新枚举，新设备由它自己补上。
+            try { if (supervisor != null) supervisor.Interrupt(); } catch { }
         }
 
-        static List<Thread> readerThreads = new List<Thread>();
         // 已建立读取连接的接口路径，防止每轮枚举重复打开
         static readonly HashSet<string> activePaths =
             new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        static List<Thread> readersSnapshot()
-        {
-            lock (readerThreads) return new List<Thread>(readerThreads);
-        }
+        // [PATCH] 原版这里还有 readerThreads 列表和 readersSnapshot()，只服务于
+        // Rescan() 里"杀线程"的逻辑。改成唤醒 supervisor 之后两者都成了死代码，
+        // 而该列表只增不减，故一并移除。
 
         static string ChargeText(int c)
         {
@@ -660,36 +757,56 @@ namespace InphicBatteryTray
             string msg;
             lock (sync)
             {
-                if (states.Count == 0)
-                {
-                    msg = "尚未收到任何电量上报。\n\n请确认：\n· 设备已连接并唤醒\n· 原程序不是独占状态（本工具为只读共享）";
-                }
-                else
-                {
-                    var sb = new System.Text.StringBuilder();
-                    foreach (var kv in states)
-                    {
-                        var d = kv.Value;
-                        bool off = (DateTime.Now - d.LastSeen).TotalMilliseconds > d.OfflineMs;
+                var sb = new System.Text.StringBuilder();
 
-                        sb.AppendLine(string.IsNullOrEmpty(d.Product) ? d.Label : d.Product);
-                        sb.AppendLine("  品牌      : " + (string.IsNullOrEmpty(d.Brand) ? "英菲克" : d.Brand));
-                        sb.AppendLine("  连接方式  : " + (string.IsNullOrEmpty(d.Transport) ? "未知" : d.Transport));
-                        sb.AppendLine(string.Format("  硬件 ID   : {0:X4}:{1:X4}", d.Vid, d.Pid));
-                        if (d.TypeCode >= 0)
-                            sb.AppendLine(string.Format("  协议族    : type 0x{0:X2}", d.TypeCode));
-                        sb.AppendLine("  协议      : " + (string.IsNullOrEmpty(d.Protocol) ? "未知" : d.Protocol));
-                        sb.AppendLine(d.ChargeState == 3
-                            ? "  电量      : 充电中（设备不报容量）"
-                            : "  电量      : " + d.Battery + "%");
-                        sb.AppendLine("  充电状态  : " + ChargeText(d.ChargeState));
-                        sb.AppendLine(string.Format("  刷新间隔  : {0:F0} ms", d.LastIntervalMs));
-                        sb.AppendLine(string.Format("  最后上报  : {0:HH:mm:ss}", d.LastSeen));
-                        sb.AppendLine("  当前状态  : " + (off ? "已断开 / 已关机" : "在线"));
-                        sb.AppendLine();
+                // [PATCH] 先按物理设备折叠。同一只鼠标的 2.4G 记录与有线记录会同时存在
+                // （插线时两台都在线，拔线后有线那台消失），只应显示一条。
+                // 同组内按 DeviceRank 取舍：在线 > 有线 > 最后上报更晚。
+                var groupOrder = new List<string>();
+                var groupBest = new Dictionary<string, DeviceState>();
+                DateTime now = DateTime.Now;
+                foreach (var kv in states)
+                {
+                    DeviceState d = kv.Value;
+                    string key = DeviceGroupKey(d);
+                    DeviceState cur;
+                    if (!groupBest.TryGetValue(key, out cur))
+                    {
+                        groupOrder.Add(key);
+                        groupBest[key] = d;
+                        continue;
                     }
-                    msg = sb.ToString();
+                    int dRank = DeviceRank(d, now);
+                    int cRank = DeviceRank(cur, now);
+                    if (dRank > cRank || (dRank == cRank && d.LastSeen > cur.LastSeen))
+                        groupBest[key] = d;
                 }
+
+                foreach (string key in groupOrder)
+                {
+                    var d = groupBest[key];
+                    bool off = (now - d.LastSeen).TotalMilliseconds > d.OfflineMs;
+
+                    sb.AppendLine(string.IsNullOrEmpty(d.Product) ? d.Label : d.Product);
+                    sb.AppendLine("  品牌      : " + (string.IsNullOrEmpty(d.Brand) ? "英菲克" : d.Brand));
+                    sb.AppendLine("  连接方式  : " + (string.IsNullOrEmpty(d.Transport) ? "未知" : d.Transport));
+                    sb.AppendLine(string.Format("  硬件 ID   : {0:X4}:{1:X4}", d.Vid, d.Pid));
+                    if (d.TypeCode >= 0)
+                        sb.AppendLine(string.Format("  协议族    : type 0x{0:X2}", d.TypeCode));
+                    sb.AppendLine("  协议      : " + (string.IsNullOrEmpty(d.Protocol) ? "未知" : d.Protocol));
+                    sb.AppendLine((d.ChargeState == 3 && (d.Brand == "瓦尔基里" || d.Protocol == "VK query"))
+                        ? "  电量      : 充电中（设备不报容量）"
+                        : "  电量      : " + d.Battery + "%");
+                    sb.AppendLine("  充电状态  : " + ChargeText(d.ChargeState));
+                    sb.AppendLine(string.Format("  刷新间隔  : {0:F0} ms", d.LastIntervalMs));
+                    sb.AppendLine(string.Format("  最后上报  : {0:HH:mm:ss}", d.LastSeen));
+                    sb.AppendLine("  当前状态  : " + (off ? "已断开 / 已关机" : "在线"));
+                    sb.AppendLine();
+                }
+
+                msg = sb.Length == 0
+                    ? "尚未收到任何电量上报。\n\n请确认：\n· 设备已连接并唤醒\n· 原程序不是独占状态（本工具为只读共享）"
+                    : sb.ToString();
             }
             ShowInfoPopup(msg);
         }
@@ -718,7 +835,26 @@ namespace InphicBatteryTray
                 try
                 {
                     List<HidInterface> all = Reader.Enumerate();
+                    // [PATCH] 诊断：已知厂商 VID 的接口，每个路径只记一次
+                    bool wiredNow = false;
+                    foreach (HidInterface d in all)
+                    {
+                        if (IsWiredSibling(d)) wiredNow = true;
+                        if (!IsKnownVid(d.Vid)) continue;
+                        bool fresh;
+                        lock (probedPaths) fresh = probedPaths.Add(d.Path);
+                        if (!fresh) continue;
+                        Log(string.Format("iface: {0:X4}:{1:X4} usagePage=0x{2:X4} usage=0x{3:X4} in={4} out={5} feat={6}  {7}",
+                            d.Vid, d.Pid, d.UsagePage, d.Usage, d.InLen, d.OutLen, d.FeatLen,
+                            string.IsNullOrEmpty(d.Product) ? "(无产品名)" : d.Product));
+                    }
+                    if (wiredNow != wiredCharging)
+                    {
+                        wiredCharging = wiredNow;
+                        Log("wired charging mode: " + (wiredNow ? "ON（检测到有线设备）" : "OFF"));
+                    }
                     var targets = new List<HidInterface>();
+                    int skippedByUsage = 0;
                     foreach (HidInterface d in all)
                     {
                         bool matched = false;
@@ -726,7 +862,15 @@ namespace InphicBatteryTray
                         {
                             if (d.Vid == c[0] && d.Pid == c[1]) { matched = true; break; }
                         }
-                        if (matched) { d.IsIn9 = false; targets.Add(d); continue; }
+                        if (matched)
+                        {
+                            // [PATCH] 只保留电量接口。原版只按 VID/PID 匹配，会把同一只鼠标的
+                            // 消费者控制(0x000C)、系统控制(0x0001)、厂商通道(0xFF00) 一并打开读取。
+                            // 实测 KP 8K：电量在 UsagePage=0x000A / usage=0x0000 / in=5。
+                            if (IsIn10(d)) { d.IsIn9 = false; targets.Add(d); }
+                            else skippedByUsage++;
+                            continue;
+                        }
 
                         // 瓦尔基里 VK 系列：mi_02 厂商通道，33 字节输入/输出报告，无 Feature 报告
                         if (IsVkCandidate(d))
@@ -748,8 +892,30 @@ namespace InphicBatteryTray
                             if (featOk) { d.IsIn9 = true; targets.Add(d); }
                         }
                     }
-                    Log(string.Format("enumerate: {0} hid interfaces, {1} candidates ({2} IN9, {3} VK)",
-                        all.Count, targets.Count, CountIn9(targets), CountVk(targets)));
+                    Log(string.Format("enumerate: {0} hid interfaces, {1} candidates ({2} IN9, {3} VK), {4} skipped by usage page",
+                        all.Count, targets.Count, CountIn9(targets), CountVk(targets), skippedByUsage));
+
+                    // [PATCH] 清理已经不存在的接口状态。
+                    // 同一只鼠标插线时会多枚举出一台 FA93（有线模式），拔线后这台设备整个
+                    // 从系统里消失，但 states 里的记录不会自己走，于是详情浮层里永远多出
+                    // 一条"已断开 / 已关机"。这里按本轮枚举结果把消失的路径删掉。
+                    // 注意：只删"系统里已经不存在"的路径。接收器还插着、只是鼠标关机导致
+                    // 链路静默的情况，路径仍在枚举结果里，记录会保留并正常显示"已断开"。
+                    var presentPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    foreach (HidInterface d in all) presentPaths.Add(d.Path);
+                    var gone = new List<string>();
+                    lock (sync)
+                    {
+                        foreach (var kv in states)
+                        {
+                            if (!presentPaths.Contains(kv.Key)) gone.Add(kv.Key);
+                        }
+                        foreach (string k in gone) states.Remove(k);
+                    }
+                    foreach (string k in gone)
+                    {
+                        Log("state pruned: " + k);
+                    }
 
                     foreach (HidInterface d in targets)
                     {
@@ -774,10 +940,13 @@ namespace InphicBatteryTray
                         });
                         t.IsBackground = true;
                         t.Start();
-                        lock (readerThreads) readerThreads.Add(t);
                     }
 
                     Thread.Sleep(10000);
+                }
+                catch (ThreadInterruptedException)
+                {
+                    // [PATCH] Rescan() 的唤醒信号：立刻重新枚举，不要再等
                 }
                 catch (Exception)
                 {
@@ -985,14 +1154,19 @@ namespace InphicBatteryTray
             lock (sync)
             {
                 DeviceState st;
-                if (!states.TryGetValue(label, out st))
+                // [PATCH] 按接口路径做键。原来用产品名当键，两只同型号接收器会互相覆盖。
+                if (!states.TryGetValue(dev.Path, out st))
                 {
                     st = new DeviceState();
                     st.Label = label;
-                    states[label] = st;
+                    states[dev.Path] = st;
                 }
                 if (st.LastSeen != DateTime.MinValue)
-                    st.LastIntervalMs = (now - st.LastSeen).TotalMilliseconds;
+                {
+                    // [PATCH] 同 ReadLoop：跨过断连空档的间隔不是真实刷新周期
+                    double gap = (now - st.LastSeen).TotalMilliseconds;
+                    if (gap <= OfflineAfterMs) st.LastIntervalMs = gap;
+                }
 
                 bool changed = (st.Battery != lv || st.ChargeState != charge);
                 st.Battery = lv;
@@ -1212,10 +1386,17 @@ namespace InphicBatteryTray
                     IntPtr.Zero, Native.OPEN_EXISTING, Native.FILE_FLAG_OVERLAPPED, IntPtr.Zero);
             }
             if (h == Native.INVALID_HANDLE_VALUE) return;
-            Log("opened: " + label);
+            // [PATCH] 把 UsagePage / Usage / 报告长度打进日志，用于确认电量接口的真实归属
+            // （上游 PR #1 硬性要求 UsagePage==0x000A 才认 IN10，需先实测确认再决定是否照做）
+            Log(string.Format("opened: {0}  usagePage=0x{1:X4} usage=0x{2:X4}  in={3} out={4} feat={5}",
+                label, dev.UsagePage, dev.Usage, dev.InLen, dev.OutLen, dev.FeatLen));
 
             IntPtr ev = Native.CreateEventW(IntPtr.Zero, true, false, IntPtr.Zero);
             var buf = new byte[256];
+            // [PATCH] 异步 IO 期间必须固定缓冲区。原版把托管数组直接传给 overlapped ReadFile，
+            // 调用返回后数组就解 pin 了，内核仍可能在后台写入；这期间 GC 压缩堆会把数组搬走，
+            // 导致内核写到错误地址（堆损坏）。固定到整个读取循环结束为止。
+            GCHandle bufPin = GCHandle.Alloc(buf, GCHandleType.Pinned);
             var ov = new Native.OVERLAPPED();
             ov.hEvent = ev;
             IntPtr ovPtr = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(Native.OVERLAPPED)));
@@ -1236,7 +1417,12 @@ namespace InphicBatteryTray
                     uint rc = Native.WaitForSingleObject(ev, 3000);
                     if (rc != Native.WAIT_OBJECT_0)
                     {
+                        // [PATCH] 取消是异步的：CancelIoEx 只是发请求，内核可能仍在访问
+                        // ovPtr 和 buf。必须阻塞等取消真正完成再进入下一轮，否则
+                        // finally 里释放 ovPtr 时就是 use-after-free。
                         Native.CancelIoEx(h, ovPtr);
+                        int aborted;
+                        Native.GetOverlappedResult(h, ovPtr, out aborted, true);
                         continue;
                     }
                     int got = 0;
@@ -1254,17 +1440,23 @@ namespace InphicBatteryTray
                         DateTime now = DateTime.Now;
                         double interval = 0;
                         if (lastReport != DateTime.MinValue)
-                            interval = (now - lastReport).TotalMilliseconds;
+                        {
+                            // [PATCH] 跨过断连空档算出来的不是刷新周期。插拔线切换时会
+                            // 出现 20s+ 的假值（实测拔线后首条显示 26654ms），过滤掉。
+                            double gap = (now - lastReport).TotalMilliseconds;
+                            if (gap <= OfflineAfterMs) interval = gap;
+                        }
                         lastReport = now;
 
                         lock (sync)
                         {
                             DeviceState st;
-                            if (!states.TryGetValue(label, out st))
+                            // [PATCH] 同上，按接口路径做键
+                            if (!states.TryGetValue(dev.Path, out st))
                             {
                                 st = new DeviceState();
                                 st.Label = label;
-                                states[label] = st;
+                                states[dev.Path] = st;
                             }
                             st.Battery = level;
                             st.ChargeState = charge;
@@ -1289,6 +1481,7 @@ namespace InphicBatteryTray
             catch (Exception) { }
             finally
             {
+                if (bufPin.IsAllocated) bufPin.Free();   // [PATCH] 释放固定
                 Marshal.FreeHGlobal(ovPtr);
                 Native.CloseHandle(ev);
                 Native.CloseHandle(h);
@@ -1298,6 +1491,7 @@ namespace InphicBatteryTray
         static void TickStatus()
         {
             int level = -1;
+            int charge = -1;
             DateTime newest = DateTime.MinValue;
             double interval = 0;
             string brand = "英菲克";
@@ -1313,6 +1507,7 @@ namespace InphicBatteryTray
                     {
                         newest = kv.Value.LastSeen;
                         level = kv.Value.Battery;
+                        charge = kv.Value.ChargeState;
                         interval = kv.Value.LastIntervalMs;
                         brand = kv.Value.Brand;
                         sleeping = kv.Value.Sleeping;
@@ -1332,38 +1527,53 @@ namespace InphicBatteryTray
             string brand, bool sleeping, bool charging)
         {
             if (string.IsNullOrEmpty(brand)) brand = "英菲克";
-            if (level != lastDrawnLevel || offline != lastDrawnOffline || charging != lastDrawnCharging)
+            // 有线充电时 2.4G 链路静默但设备还在，不能当"已关机"灰显（沿用 maint 稳定分支逻辑）
+            bool cable = offline && wiredCharging && level >= 0;
+            bool grey = offline && !cable;
+            // 蓝色整条只给瓦尔基里（充电时设备不报容量）；英菲克保持显示实时电量
+            bool blueCharging = charging && brand == "瓦尔基里";
+            // 加锁：TickStatus(UI 线程) 与 UpdateTrayUI(读取线程) 会并发进入，
+            // DrawIcon 里对同一 srcIcon 并发 DrawImage 会偶发 GDI+ 异常
+            lock (trayLock)
             {
-                Log(string.Format("tray state: level={0} offline={1} charging={2}", level, offline, charging));
-                Icon old = currentIcon;
-                currentIcon = DrawIcon(level, offline, charging);
-                tray.Icon = currentIcon;
-                lastDrawnLevel = level;
-                lastDrawnOffline = offline;
-                lastDrawnCharging = charging;
-                if (old != null) { try { old.Dispose(); } catch { } }
+                if (level != lastDrawnLevel || grey != lastDrawnOffline || blueCharging != lastDrawnCharging)
+                {
+                    Log(string.Format("tray state: level={0} offline={1} grey={2} cable={3} charging={4} brand={5}",
+                        level, offline, grey, cable, charging, brand));
+                    Icon old = currentIcon;
+                    currentIcon = DrawIcon(level, grey, blueCharging);
+                    tray.Icon = currentIcon;
+                    lastDrawnLevel = level;
+                    lastDrawnOffline = grey;
+                    lastDrawnCharging = blueCharging;
+                    if (old != null) { try { old.Dispose(); } catch { } }
+                }
+
+                string tip;
+                if (level < 0)
+                    tip = brand + "：未检测到设备";
+                else if (cable)
+                    tip = string.Format("{0}：充电中（有线，最后 {1}%）", brand, level);
+                else if (offline)
+                    tip = string.Format("{0}：已断开 / 已关机（最后 {1}%，{2:HH:mm:ss}）",
+                        brand, level, lastSeen);
+                else if (blueCharging)
+                    tip = brand + "：充电中（设备不报容量）";
+                else if (sleeping)
+                    tip = string.Format("{0} 电量 {1}%（设备休眠，沿用上次读数）", brand, level);
+                else
+                    tip = string.Format("{0} 电量 {1}%  ({2:F0}ms 刷新)", brand, level, interval);
+
+                // NotifyIcon.Text 上限 63 字符（szTip 64 wchar），超长会抛异常
+                if (tip.Length > 63) tip = tip.Substring(0, 63);
+                tray.Text = tip;
             }
-
-            string tip;
-            if (level < 0)
-                tip = brand + "：未检测到设备";
-            else if (offline)
-                tip = string.Format("{0}：已断开 / 已关机（最后 {1}%，{2:HH:mm:ss}）",
-                    brand, level, lastSeen);
-            else if (charging)
-                tip = brand + "：充电中（设备不报容量）";
-            else if (sleeping)
-                tip = string.Format("{0} 电量 {1}%（设备休眠，沿用上次读数）", brand, level);
-            else
-                tip = string.Format("{0} 电量 {1}%  ({2:F0}ms 刷新)", brand, level, interval);
-
-            if (tip.Length > 127) tip = tip.Substring(0, 127);
-            tray.Text = tip;
         }
 
         static void UpdateTrayUI()
         {
             int level = -1;
+            int charge = -1;
             double interval = 0;
             DateTime newest = DateTime.MinValue;
             string brand = "英菲克";
@@ -1378,6 +1588,7 @@ namespace InphicBatteryTray
                     {
                         newest = kv.Value.LastSeen;
                         level = kv.Value.Battery;
+                        charge = kv.Value.ChargeState;
                         interval = kv.Value.LastIntervalMs;
                         brand = kv.Value.Brand;
                         sleeping = kv.Value.Sleeping;
@@ -1397,6 +1608,8 @@ namespace InphicBatteryTray
     class InfoPopup : Form
     {
         System.Windows.Forms.Timer lifeTimer;
+        // [PATCH] 缓存字体引用，关闭时释放（原版 new Font 后从不 Dispose，泄漏 GDI 句柄）
+        System.Drawing.Font lblFont;
         int countdown;
 
         protected override bool ShowWithoutActivation { get { return true; } }
@@ -1424,7 +1637,8 @@ namespace InphicBatteryTray
             lbl.Dock = DockStyle.Fill;
             lbl.Text = text;
             lbl.ForeColor = Color.FromArgb(236, 236, 242);
-            lbl.Font = new Font("Consolas", 9F, FontStyle.Regular, GraphicsUnit.Point);
+            lblFont = new System.Drawing.Font("Consolas", 9F, FontStyle.Regular, GraphicsUnit.Point);
+            lbl.Font = lblFont;
             lbl.TextAlign = ContentAlignment.TopLeft;
             lbl.BackColor = Color.Transparent;
             Controls.Add(lbl);
@@ -1450,6 +1664,14 @@ namespace InphicBatteryTray
             lbl.MouseLeave += leave;
             Click += delegate { Close(); };
             lbl.Click += delegate { Close(); };
+
+            // [PATCH] 关闭时停掉并释放定时器。原版 lifeTimer 从不 Stop/Dispose，
+            // 浮层关掉后仍每秒触发一次，每开一次详情就永久泄漏一个 1Hz 定时器。
+            FormClosed += delegate
+            {
+                try { lifeTimer.Stop(); lifeTimer.Dispose(); } catch { }
+                try { if (lblFont != null) { lblFont.Dispose(); lblFont = null; } } catch { }
+            };
         }
 
         public void ShowNear(Point anchor)
